@@ -18,9 +18,11 @@
 |---|---|
 | `[plugin].auto_detect_models` | 加载时自动检测并同步启用模型 |
 | `[plugin].model_config_path` | 可选：`model_config.toml` 绝对路径 |
-| `[global_limit].max_requests_per_minute` | 全局每分钟请求上限（`0`=不限） |
-| `[global_limit].disable_seconds` | 全局超限后禁用秒数 |
-| `[[limits.providers]]` / `[[limits.models]]` | 厂商 / 模型 RPM 与禁用秒数 |
+| `[global_limit].enabled` | 限流/禁用总开关 |
+| `[global_limit].max_requests_per_minute` | （已弃用）保持 `0`（全局 RPM 无意义，改用厂商/模型 RPM） |
+| `[global_limit].disable_seconds` | 功能全灭等「全局停模」的禁用秒数（默认 90） |
+| `[[limits.providers]]` | 厂商 RPM（默认 **30**/分钟，超限禁用 **90** 秒） |
+| `[[limits.models]]` | 模型 RPM（默认 **10**/分钟，超限禁用 **90** 秒） |
 | `[error_disable].base_seconds` | 首次模型错误禁用秒数 |
 | `[error_disable].exponential` | 连续错误是否指数退避 |
 | `[feature_kill].enabled` | 某项功能下的模型全部遇到错误时是否全局禁用LLM |
@@ -37,14 +39,27 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "1.3.0"
+config_version = "1.3.1"
 auto_detect_models = true
 model_config_path = ""
 
 [global_limit]
 enabled = true
-max_requests_per_minute = 60
-disable_seconds = 300
+# 全局 RPM 已停用，保持 0
+max_requests_per_minute = 0
+disable_seconds = 90
+
+# 自动同步时新项默认：厂商 30 RPM / 模型 10 RPM，超限禁用 90 秒
+# [[limits.providers]]
+# name = "openai"
+# max_requests_per_minute = 30
+# disable_seconds = 90
+#
+# [[limits.models]]
+# name = "replyer"
+# provider = "openai"
+# max_requests_per_minute = 10
+# disable_seconds = 90
 
 [error_disable]
 enabled = true
@@ -74,12 +89,14 @@ whitelist = []
 notify_permission_denied = true
 ```
 
+限流生效顺序：**厂商 RPM → 模型 RPM**（全局 RPM 已关闭）。两者同时生效，更严的先拦住。
+
 ## 通知转发
 
 开启 `[notify].enabled` 后，在以下**新触发**时向目标会话发一条文本（同批合并为一条，避免刷屏）：
 
-- 全局 / 厂商 / 模型 RPM 超限
-- 新进入全局停模（含功能模型全灭、全局 RPM）
+- 厂商 / 模型 RPM 超限
+- 新进入全局停模（含功能模型全灭）
 
 目标解析方式与 `redirect_err` 相同：`group` / `private` / `stream_id`。
 

@@ -31,7 +31,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.3.0", description="配置版本")
+    config_version: str = Field(default="1.3.1", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
         description="加载时自动检测启用模型，保留同名模型的配置",
@@ -47,9 +47,16 @@ class GlobalConfig(PluginConfigBase):
     __ui_icon__ = "gauge"
     __ui_order__ = 1
 
-    enabled: bool = Field(default=True, description="是否启用限流与禁用逻辑")
-    max_requests_per_minute: int = Field(default=60, description="全局每分钟请求上限（0=不限）")
-    disable_seconds: int = Field(default=300, description="全局超限后禁用秒数")
+    enabled: bool = Field(default=True, description="是否启用限流与禁用逻辑（总开关）")
+    # 全局 RPM 无实际意义，默认关闭；
+    max_requests_per_minute: int = Field(
+        default=0,
+        description="【已弃用】全局每分钟请求上限；请保持 0，改用厂商/模型 RPM",
+    )
+    disable_seconds: int = Field(
+        default=90,
+        description="全局禁用秒数",
+    )
 
 
 class ProviderLimitConfig(PluginConfigBase):
@@ -58,8 +65,8 @@ class ProviderLimitConfig(PluginConfigBase):
     __ui_order__ = 0
 
     name: str = Field(default="", description="厂商名")
-    max_requests_per_minute: int = Field(default=0, description="每分钟上限（0=不限）")
-    disable_seconds: int = Field(default=600, description="超限禁用秒数")
+    max_requests_per_minute: int = Field(default=30, description="每分钟上限（0=不限）")
+    disable_seconds: int = Field(default=90, description="超限禁用秒数")
 
 
 class ModelLimitConfig(PluginConfigBase):
@@ -69,8 +76,8 @@ class ModelLimitConfig(PluginConfigBase):
 
     name: str = Field(default="", description="模型名")
     provider: str = Field(default="", description="厂商名")
-    max_requests_per_minute: int = Field(default=0, description="每分钟上限（0=不限）")
-    disable_seconds: int = Field(default=900, description="超限禁用秒数")
+    max_requests_per_minute: int = Field(default=10, description="每分钟上限（0=不限）")
+    disable_seconds: int = Field(default=90, description="超限禁用秒数")
 
 
 class LimitsConfig(PluginConfigBase):
@@ -193,11 +200,11 @@ class HoldOnPlugin(MaiBotPlugin):
             self._watcher.start()
 
         self.ctx.logger.info(
-            "hold_on 已加载：enabled=%s global_rpm=%s features=%s models=%s",
+            "hold_on 已加载：enabled=%s provider_limits=%s model_limits=%s features=%s",
             bool(self.config.plugin.enabled),
-            int(self.config.global_limit.max_requests_per_minute or 0),
-            [f.feature for f in (self.config.feature_kill.features or []) if f.feature],
+            len(self.config.limits.providers or []),
             len(self.config.limits.models or []),
+            [f.feature for f in (self.config.feature_kill.features or []) if f.feature],
         )
 
     async def on_unload(self) -> None:
@@ -224,7 +231,13 @@ class HoldOnPlugin(MaiBotPlugin):
             self.ctx.logger.warning("hold_on 未找到 model_config.toml，跳过自动检测")
             return
 
-        sections = discovery_to_config_sections(result)
+        sections = discovery_to_config_sections(
+            result,
+            default_model_rpm=10,
+            default_model_disable=90,
+            default_provider_rpm=30,
+            default_provider_disable=90,
+        )
         prev_models = {
             str(m.name).strip(): m for m in (self.config.limits.models or []) if str(m.name or "").strip()
         }
@@ -243,10 +256,12 @@ class HoldOnPlugin(MaiBotPlugin):
                     name=name,
                     provider=str(item.get("provider") or (old.provider if old else "") or ""),
                     max_requests_per_minute=int(
-                        old.max_requests_per_minute if old is not None else item.get("max_requests_per_minute") or 0
+                        old.max_requests_per_minute
+                        if old is not None
+                        else item.get("max_requests_per_minute") or 10
                     ),
                     disable_seconds=int(
-                        old.disable_seconds if old is not None else item.get("disable_seconds") or 900
+                        old.disable_seconds if old is not None else item.get("disable_seconds") or 90
                     ),
                 )
             )
@@ -261,10 +276,12 @@ class HoldOnPlugin(MaiBotPlugin):
                 ProviderLimitConfig(
                     name=name,
                     max_requests_per_minute=int(
-                        old.max_requests_per_minute if old is not None else item.get("max_requests_per_minute") or 0
+                        old.max_requests_per_minute
+                        if old is not None
+                        else item.get("max_requests_per_minute") or 30
                     ),
                     disable_seconds=int(
-                        old.disable_seconds if old is not None else item.get("disable_seconds") or 600
+                        old.disable_seconds if old is not None else item.get("disable_seconds") or 90
                     ),
                 )
             )
@@ -312,21 +329,22 @@ class HoldOnPlugin(MaiBotPlugin):
         payload = {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "1.3.0",
+                "config_version": "1.3.1",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
             "global_limit": {
                 "enabled": bool(self.config.global_limit.enabled),
-                "max_requests_per_minute": int(self.config.global_limit.max_requests_per_minute or 0),
-                "disable_seconds": int(self.config.global_limit.disable_seconds or 300),
+                # 全局 RPM 已停用，写盘固定为 0
+                "max_requests_per_minute": 0,
+                "disable_seconds": int(self.config.global_limit.disable_seconds or 90),
             },
             "limits": {
                 "providers": [
                     {
                         "name": p.name,
                         "max_requests_per_minute": int(p.max_requests_per_minute or 0),
-                        "disable_seconds": int(p.disable_seconds or 600),
+                        "disable_seconds": int(p.disable_seconds or 90),
                     }
                     for p in (self.config.limits.providers or [])
                     if p.name
@@ -336,7 +354,7 @@ class HoldOnPlugin(MaiBotPlugin):
                         "name": m.name,
                         "provider": m.provider,
                         "max_requests_per_minute": int(m.max_requests_per_minute or 0),
-                        "disable_seconds": int(m.disable_seconds or 900),
+                        "disable_seconds": int(m.disable_seconds or 90),
                     }
                     for m in (self.config.limits.models or [])
                     if m.name
@@ -387,7 +405,7 @@ class HoldOnPlugin(MaiBotPlugin):
             NamedLimit(
                 name=str(p.name or "").strip(),
                 max_requests_per_minute=int(p.max_requests_per_minute or 0),
-                disable_seconds=int(p.disable_seconds or 600),
+                disable_seconds=int(p.disable_seconds or 90),
             )
             for p in (self.config.limits.providers or [])
             if str(p.name or "").strip()
@@ -397,7 +415,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 name=str(m.name or "").strip(),
                 provider=str(m.provider or "").strip(),
                 max_requests_per_minute=int(m.max_requests_per_minute or 0),
-                disable_seconds=int(m.disable_seconds or 900),
+                disable_seconds=int(m.disable_seconds or 90),
             )
             for m in (self.config.limits.models or [])
             if str(m.name or "").strip()
@@ -412,8 +430,9 @@ class HoldOnPlugin(MaiBotPlugin):
         ]
         return HoldOnPolicy(
             self.state,
-            global_max_rpm=int(self.config.global_limit.max_requests_per_minute or 0),
-            global_disable_seconds=int(self.config.global_limit.disable_seconds or 300),
+            # 全局 RPM 已停用：始终按 0 处理，避免旧配置误伤
+            global_max_rpm=0,
+            global_disable_seconds=int(self.config.global_limit.disable_seconds or 90),
             provider_limits=providers,
             model_limits=models,
             features=features,

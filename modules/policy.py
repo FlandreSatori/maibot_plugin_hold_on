@@ -13,7 +13,7 @@ from .state import HoldOnState
 class NamedLimit:
     name: str
     max_requests_per_minute: int = 0
-    disable_seconds: int = 600
+    disable_seconds: int = 90
     provider: str = ""
 
 
@@ -129,7 +129,7 @@ class HoldOnPolicy:
             if plimit and plimit.max_requests_per_minute > 0:
                 count = self.state.record_hit(f"provider:{prov}")
                 if count > plimit.max_requests_per_minute:
-                    seconds = plimit.disable_seconds or self.global_disable_seconds or 600
+                    seconds = plimit.disable_seconds or self.global_disable_seconds or 90
                     reason = f"厂商 RPM 超限（{count}/{plimit.max_requests_per_minute}）"
                     self.state.set_disable(
                         scope="provider",
@@ -151,7 +151,7 @@ class HoldOnPolicy:
             if mlimit and mlimit.max_requests_per_minute > 0:
                 count = self.state.record_hit(f"model:{model}")
                 if count > mlimit.max_requests_per_minute:
-                    seconds = mlimit.disable_seconds or self.global_disable_seconds or 900
+                    seconds = mlimit.disable_seconds or self.global_disable_seconds or 90
                     reason = f"模型 RPM 超限（{count}/{mlimit.max_requests_per_minute}）"
                     self.state.set_disable(
                         scope="model",
@@ -230,7 +230,7 @@ class HoldOnPolicy:
         self.state.set_disable(
             scope="global",
             key="all",
-            seconds=self.global_disable_seconds or 300,
+            seconds=self.global_disable_seconds or 90,
             reason=reason,
             source=source,
         )

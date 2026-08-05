@@ -125,10 +125,10 @@ def discover_models(extra_paths: Sequence[str] | None = None) -> Optional[Discov
 def discovery_to_config_sections(
     result: DiscoveryResult,
     *,
-    default_model_rpm: int = 0,
-    default_model_disable: int = 900,
-    default_provider_rpm: int = 0,
-    default_provider_disable: int = 600,
+    default_model_rpm: int = 10,
+    default_model_disable: int = 90,
+    default_provider_rpm: int = 30,
+    default_provider_disable: int = 90,
 ) -> Dict[str, Any]:
     """转为可写入 config.toml / 内存配置的结构。"""
 
