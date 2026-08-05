@@ -23,6 +23,16 @@ class FeatureModels:
     models: Tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PolicyEvent:
+    """策略新触发事件（用于通知转发，避免重复刷屏）。"""
+
+    kind: str  # rpm_global / rpm_provider / rpm_model / global_stop
+    reason: str
+    scope: str = ""
+    key: str = ""
+
+
 class HoldOnPolicy:
     """根据配置与状态判定是否拦截、禁用多久。"""
 
@@ -86,35 +96,33 @@ class HoldOnPolicy:
             return True
         return False
 
-    def note_request(self, *, model_name: str = "", provider: str = "") -> Optional[str]:
-        """记录一次请求；若触达限流则禁用并返回原因。"""
+    def note_request(self, *, model_name: str = "", provider: str = "") -> List[PolicyEvent]:
+        """记录一次请求；若**新**触达限流则返回事件列表。"""
 
         if self.state.global_stop or self.state.is_disabled("global", "all"):
-            return "全局停模中"
+            return []
 
         model = str(model_name or "").strip()
         prov = str(provider or "").strip() or self.provider_of(model)
 
         if model and self.state.is_disabled("model", model):
-            entry = self.state.get_disable("model", model)
-            return entry.reason if entry else f"模型 {model} 已禁用"
+            return []
         if prov and self.state.is_disabled("provider", prov):
-            entry = self.state.get_disable("provider", prov)
-            return entry.reason if entry else f"厂商 {prov} 已禁用"
+            return []
+
+        events: List[PolicyEvent] = []
 
         global_count = self.state.record_hit("global")
         if self.global_max_rpm > 0 and global_count > self.global_max_rpm:
-            seconds = self.global_disable_seconds or 300
             reason = f"全局 RPM 超限（{global_count}/{self.global_max_rpm}）"
-            self.state.set_disable(
-                scope="global",
-                key="all",
-                seconds=seconds,
-                reason=reason,
-                source="ratelimit",
+            events.append(
+                PolicyEvent(kind="rpm_global", reason=reason, scope="global", key="all")
             )
-            self.state.set_global_stop(True, reason)
-            return reason
+            if self._activate_global_stop(reason, source="ratelimit"):
+                events.append(
+                    PolicyEvent(kind="global_stop", reason=reason, scope="global", key="all")
+                )
+            return events
 
         if prov:
             plimit = self.provider_limits.get(prov)
@@ -130,8 +138,13 @@ class HoldOnPolicy:
                         reason=reason,
                         source="ratelimit",
                     )
-                    self._maybe_feature_kill()
-                    return f"厂商 {prov} RPM 超限"
+                    events.append(
+                        PolicyEvent(kind="rpm_provider", reason=reason, scope="provider", key=prov)
+                    )
+                    kill = self._maybe_feature_kill()
+                    if kill is not None:
+                        events.append(kill)
+                    return events
 
         if model:
             mlimit = self.model_limits.get(model)
@@ -148,12 +161,17 @@ class HoldOnPolicy:
                         source="ratelimit",
                         error_streak=0,
                     )
-                    self._maybe_feature_kill()
-                    return f"模型 {model} RPM 超限"
+                    events.append(
+                        PolicyEvent(kind="rpm_model", reason=reason, scope="model", key=model)
+                    )
+                    kill = self._maybe_feature_kill()
+                    if kill is not None:
+                        events.append(kill)
+                    return events
             else:
                 self.state.record_hit(f"model:{model}")
 
-        return None
+        return []
 
     def compute_error_disable_seconds(self, streak: int, retry_after: Optional[float] = None) -> float:
         streak = max(1, int(streak or 1))
@@ -176,12 +194,12 @@ class HoldOnPolicy:
         provider: str = "",
         message: str = "",
         retry_after: Optional[float] = None,
-    ) -> Optional[str]:
-        """任意模型错误均禁用，不区分错误类型。"""
+    ) -> List[PolicyEvent]:
+        """任意模型错误均禁用；若因此新触发全局停模则返回事件。"""
 
         model = str(model_name or "").strip()
         if not model:
-            return None
+            return []
         prov = str(provider or "").strip() or self.provider_of(model)
         self.register_model_provider(model, prov)
         streak = self.state.bump_error_streak("model", model)
@@ -196,32 +214,46 @@ class HoldOnPolicy:
             source="error",
             error_streak=streak,
         )
-        self._maybe_feature_kill()
-        return reason
+        kill = self._maybe_feature_kill()
+        return [kill] if kill is not None else []
 
     def on_success(self, model_name: str) -> None:
         model = str(model_name or "").strip()
         if model:
             self.state.reset_error_streak("model", model)
 
-    def _maybe_feature_kill(self) -> None:
+    def _activate_global_stop(self, reason: str, *, source: str) -> bool:
+        """置全局停模；若为新触发返回 True。"""
+
+        already = bool(self.state.global_stop or self.state.is_disabled("global", "all"))
+        self.state.set_global_stop(True, reason)
+        self.state.set_disable(
+            scope="global",
+            key="all",
+            seconds=self.global_disable_seconds or 300,
+            reason=reason,
+            source=source,
+        )
+        return not already
+
+    def _maybe_feature_kill(self) -> Optional[PolicyEvent]:
         if not self.feature_kill_enabled or not self.features:
-            return
+            return None
         for feature, models in self.features.items():
             names = [m for m in models if str(m).strip()]
             if not names:
                 continue
             if all(self.state.is_disabled("model", m) for m in names):
                 reason = f"功能 {feature} 的全部模型均已禁用: {', '.join(names)}"
-                self.state.set_global_stop(True, reason)
-                self.state.set_disable(
-                    scope="global",
-                    key="all",
-                    seconds=self.global_disable_seconds or 300,
-                    reason=reason,
-                    source="feature_kill",
-                )
-                return
+                if self._activate_global_stop(reason, source="feature_kill"):
+                    return PolicyEvent(
+                        kind="global_stop",
+                        reason=reason,
+                        scope="global",
+                        key="all",
+                    )
+                return None
+        return None
 
     def refresh_feature_kill(self) -> None:
         if not self.state.global_stop:

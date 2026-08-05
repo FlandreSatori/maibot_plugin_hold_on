@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
@@ -16,7 +16,7 @@ from .modules.model_discover import (
     discovery_to_config_sections,
     write_simple_toml,
 )
-from .modules.policy import FeatureModels, HoldOnPolicy, NamedLimit
+from .modules.policy import FeatureModels, HoldOnPolicy, NamedLimit, PolicyEvent
 from .modules.state import HoldOnState
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -31,7 +31,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.2.1", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
         description="加载时自动检测启用模型，保留同名模型的配置",
@@ -128,10 +128,29 @@ class ErrorWatchConfig(PluginConfigBase):
     )
 
 
+class NotifyConfig(PluginConfigBase):
+    """RPM / 全局禁用触发时转发通知（参考 redirect_err）。"""
+
+    __ui_label__ = "通知转发"
+    __ui_icon__ = "corner-up-right"
+    __ui_order__ = 6
+
+    enabled: bool = Field(default=False, description="触发 RPM 或新进入全局停模时是否转发到指定会话")
+    target_type: str = Field(
+        default="group",
+        description="目标类型：group / private / stream_id",
+    )
+    group_id: str = Field(default="", description="目标群号（target_type=group）")
+    user_id: str = Field(default="", description="目标私聊用户 ID（target_type=private）")
+    stream_id: str = Field(default="", description="目标 stream_id（target_type=stream_id）")
+    platform: str = Field(default="qq", description="解析群/私聊时的平台")
+    prefix: str = Field(default="[hold_on] ", description="通知前缀")
+
+
 class PermissionConfig(PluginConfigBase):
     __ui_label__ = "权限"
     __ui_icon__ = "shield"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
     whitelist: list[str] = Field(default_factory=list, description="管理命令白名单 user_id 或 platform:user_id")
     notify_permission_denied: bool = Field(default=True, description="无权限时是否提示")
@@ -144,6 +163,7 @@ class HoldOnConfig(PluginConfigBase):
     error_disable: ErrorDisableConfig = Field(default_factory=ErrorDisableConfig)
     feature_kill: FeatureKillConfig = Field(default_factory=FeatureKillConfig)
     error_watch: ErrorWatchConfig = Field(default_factory=ErrorWatchConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
     permission: PermissionConfig = Field(default_factory=PermissionConfig)
 
 
@@ -292,7 +312,7 @@ class HoldOnPlugin(MaiBotPlugin):
         payload = {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "1.2.1",
+                "config_version": "1.3.0",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
@@ -341,6 +361,15 @@ class HoldOnPlugin(MaiBotPlugin):
                 "enabled": bool(self.config.error_watch.enabled),
                 "interval_seconds": float(self.config.error_watch.interval_seconds or 2.0),
                 "roots": list(self.config.error_watch.roots or []),
+            },
+            "notify": {
+                "enabled": bool(self.config.notify.enabled),
+                "target_type": str(self.config.notify.target_type or "group"),
+                "group_id": str(self.config.notify.group_id or ""),
+                "user_id": str(self.config.notify.user_id or ""),
+                "stream_id": str(self.config.notify.stream_id or ""),
+                "platform": str(self.config.notify.platform or "qq"),
+                "prefix": str(self.config.notify.prefix or "[hold_on] "),
             },
             "permission": {
                 "whitelist": list(self.config.permission.whitelist or []),
@@ -414,20 +443,125 @@ class HoldOnPlugin(MaiBotPlugin):
     ) -> None:
         if not self._active() or not bool(self.config.error_disable.enabled):
             return
-        reason = self.policy.disable_for_error(
+        events = self.policy.disable_for_error(
             model_name=model_name,
             provider=provider,
             message=message,
             retry_after=retry_after,
         )
-        if reason:
-            self.ctx.logger.warning(
-                "hold_on 错误禁用：model=%s provider=%s reason=%s path=%s",
-                model_name,
-                provider,
-                reason,
-                Path(source_path).name if source_path else "",
+        self.ctx.logger.warning(
+            "hold_on 错误禁用：model=%s provider=%s path=%s events=%s",
+            model_name,
+            provider,
+            Path(source_path).name if source_path else "",
+            [e.kind for e in events],
+        )
+        await self._notify_events(events)
+
+    # ─── 通知转发 ────────────────────────────────────────────────
+
+    @staticmethod
+    def _pick_stream_id(payload: Any) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload.strip()
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("stream_id", "session_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        nested = payload.get("stream")
+        if isinstance(nested, dict):
+            for key in ("stream_id", "session_id"):
+                value = str(nested.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    async def _resolve_notify_stream_id(self) -> str:
+        cfg = self.config.notify
+        target_type = str(cfg.target_type or "group").strip().lower()
+        platform = str(cfg.platform or "qq").strip() or "qq"
+
+        if target_type == "stream_id":
+            return str(cfg.stream_id or "").strip()
+
+        if target_type == "group":
+            group_id = str(cfg.group_id or "").strip()
+            if not group_id:
+                return ""
+            found = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
+            stream_id = self._pick_stream_id(found)
+            if stream_id:
+                return stream_id
+            opened = await self.ctx.chat.open_session(
+                platform=platform,
+                chat_type="group",
+                group_id=group_id,
             )
+            return self._pick_stream_id(opened)
+
+        if target_type == "private":
+            user_id = str(cfg.user_id or "").strip()
+            if not user_id:
+                return ""
+            found = await self.ctx.chat.get_stream_by_user_id(user_id=user_id, platform=platform)
+            stream_id = self._pick_stream_id(found)
+            if stream_id:
+                return stream_id
+            opened = await self.ctx.chat.open_session(
+                platform=platform,
+                chat_type="private",
+                user_id=user_id,
+            )
+            return self._pick_stream_id(opened)
+
+        self.ctx.logger.warning("hold_on 未知 notify.target_type=%r", target_type)
+        return ""
+
+    @staticmethod
+    def _event_label(kind: str) -> str:
+        return {
+            "rpm_global": "全局限流",
+            "rpm_provider": "厂商限流",
+            "rpm_model": "模型限流",
+            "global_stop": "全局停模",
+        }.get(kind, kind)
+
+    async def _notify_events(self, events: List[PolicyEvent]) -> None:
+        if not events or not bool(self.config.notify.enabled):
+            return
+        # 同批合并为一条，避免 RPM+全局停模连发两条
+        lines = ["触发稍等策略："]
+        seen: set[str] = set()
+        for event in events:
+            key = f"{event.kind}:{event.reason}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- [{self._event_label(event.kind)}] {event.reason}")
+        text = "\n".join(lines)
+        prefix = str(self.config.notify.prefix or "")
+        outbound = f"{prefix}{text}" if prefix else text
+
+        try:
+            target = await self._resolve_notify_stream_id()
+        except Exception as exc:
+            self.ctx.logger.error("hold_on 解析通知目标失败: %s", exc, exc_info=True)
+            return
+        if not target:
+            self.ctx.logger.warning("hold_on 通知未配置有效目标，已跳过发送")
+            return
+        try:
+            sent = await self.ctx.send.text(outbound, target)
+            if not sent:
+                self.ctx.logger.warning("hold_on 通知发送失败 target=%s", target)
+            else:
+                self.ctx.logger.info("hold_on 已转发通知 target=%s events=%s", target, [e.kind for e in events])
+        except Exception as exc:
+            self.ctx.logger.error("hold_on 通知发送异常: %s", exc, exc_info=True)
 
     # ─── 权限 / 命令辅助 ─────────────────────────────────────────
 
@@ -495,9 +629,14 @@ class HoldOnPlugin(MaiBotPlugin):
         if session_id and model:
             self._last_selected_model[str(session_id)] = model
         if model:
-            reason = self.policy.note_request(model_name=model)
-            if reason:
-                self.ctx.logger.warning("hold_on 限流触发：%s model=%s", reason, model)
+            events = self.policy.note_request(model_name=model)
+            if events:
+                self.ctx.logger.warning(
+                    "hold_on 限流触发：model=%s events=%s",
+                    model,
+                    [(e.kind, e.reason) for e in events],
+                )
+                await self._notify_events(events)
         return {"action": "continue"}
 
     @HookHandler(

@@ -26,6 +26,10 @@
 | `[feature_kill].enabled` | 某项功能下的模型全部遇到错误时是否全局禁用LLM |
 | `[[feature_kill.features]]` | 功能名 → 模型列表 |
 | `[error_watch].roots` | 额外监听的失败快照目录 |
+| `[notify].enabled` | 触发 RPM / 新全局停模时是否转发通知 |
+| `[notify].target_type` | `group` / `private` / `stream_id` |
+| `[notify].group_id` / `user_id` / `stream_id` | 对应目标 |
+| `[notify].prefix` | 通知前缀，默认 `[hold_on] ` |
 | `[permission].whitelist` | 管理命令白名单 |
 
 ### 配置模板示例
@@ -33,7 +37,7 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "1.2.1"
+config_version = "1.3.0"
 auto_detect_models = true
 model_config_path = ""
 
@@ -56,10 +60,28 @@ enabled = true
 enabled = true
 interval_seconds = 2.0
 
+[notify]
+enabled = false
+target_type = "group"
+group_id = ""
+user_id = ""
+stream_id = ""
+platform = "qq"
+prefix = "[hold_on] "
+
 [permission]
 whitelist = []
 notify_permission_denied = true
 ```
+
+## 通知转发
+
+开启 `[notify].enabled` 后，在以下**新触发**时向目标会话发一条文本（同批合并为一条，避免刷屏）：
+
+- 全局 / 厂商 / 模型 RPM 超限
+- 新进入全局停模（含功能模型全灭、全局 RPM）
+
+目标解析方式与 `redirect_err` 相同：`group` / `private` / `stream_id`。
 
 ## 命令
 
