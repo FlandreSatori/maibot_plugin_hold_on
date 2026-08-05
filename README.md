@@ -10,7 +10,9 @@
 
 插件 ID：`maibot_plugin.hold_on`
 
-`auto_detect_models = true` 时，**每次加载**都会读取宿主 `config/model_config.toml`，同步 `limits` 与 `feature_kill.features`。同名模型/厂商会保留你已配置的 RPM / 禁用秒数。
+`auto_detect_models = true` 时，**每次加载**都会用 `tomllib` 读取宿主 `config/model_config.toml`，同步 `limits` 与 `feature_kill.features`。同名模型/厂商会保留你已配置的 RPM / 禁用秒数。
+
+> 不使用宿主 `llm.get_available_models`：该能力只返回任务名列表，没有厂商与 `model_task_config` 功能→模型映射，无法支撑本插件的 RPM / 功能全灭配置。
 
 ## 配置
 
@@ -28,7 +30,7 @@
 | `[feature_kill].enabled` | 某项功能下的模型全部遇到错误时是否全局禁用LLM |
 | `[[feature_kill.features]]` | 功能名 → 模型列表 |
 | `[error_watch].roots` | 额外监听的失败快照目录 |
-| `[notify].enabled` | 触发 RPM / 新全局停模时是否转发通知 |
+| `[notify].enabled` | 触发 RPM / 模型错误新禁用 / 新全局停模时是否转发通知 |
 | `[notify].target_type` | `group` / `private` / `stream_id` |
 | `[notify].group_id` / `user_id` / `stream_id` | 对应目标 |
 | `[notify].prefix` | 通知前缀，默认 `[hold_on] ` |
@@ -39,7 +41,7 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "1.3.1"
+config_version = "1.3.2"
 auto_detect_models = true
 model_config_path = ""
 
@@ -96,9 +98,10 @@ notify_permission_denied = true
 开启 `[notify].enabled` 后，在以下**新触发**时向目标会话发一条文本（同批合并为一条，避免刷屏）：
 
 - 厂商 / 模型 RPM 超限
+- 模型错误导致**新进入**禁用（连击延长已有禁用不重复通知）
 - 新进入全局停模（含功能模型全灭）
 
-目标解析方式与 `redirect_err` 相同：`group` / `private` / `stream_id`。
+目标解析方式与 `redirect_err` 相同：`group` / `private` / `stream_id`。需同时填写对应的 `group_id` / `user_id` / `stream_id`（默认 `enabled = false` 且 `group_id` 为空）。
 
 ## 命令
 

@@ -31,7 +31,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.3.1", description="配置版本")
+    config_version: str = Field(default="1.3.2", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
         description="加载时自动检测启用模型，保留同名模型的配置",
@@ -329,7 +329,7 @@ class HoldOnPlugin(MaiBotPlugin):
         payload = {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "1.3.1",
+                "config_version": "1.3.2",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
@@ -505,37 +505,70 @@ class HoldOnPlugin(MaiBotPlugin):
         platform = str(cfg.platform or "qq").strip() or "qq"
 
         if target_type == "stream_id":
-            return str(cfg.stream_id or "").strip()
+            stream_id = str(cfg.stream_id or "").strip()
+            if not stream_id:
+                self.ctx.logger.warning("hold_on 通知 target_type=stream_id 但 stream_id 为空")
+            return stream_id
 
         if target_type == "group":
             group_id = str(cfg.group_id or "").strip()
             if not group_id:
+                self.ctx.logger.warning("hold_on 通知 target_type=group 但 group_id 为空")
                 return ""
             found = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
             stream_id = self._pick_stream_id(found)
             if stream_id:
                 return stream_id
+            self.ctx.logger.info(
+                "hold_on 通知未找到已有群会话，尝试 open_session group_id=%s platform=%s found=%r",
+                group_id,
+                platform,
+                found,
+            )
             opened = await self.ctx.chat.open_session(
                 platform=platform,
                 chat_type="group",
                 group_id=group_id,
             )
-            return self._pick_stream_id(opened)
+            stream_id = self._pick_stream_id(opened)
+            if not stream_id:
+                self.ctx.logger.warning(
+                    "hold_on 通知无法解析群会话 group_id=%s platform=%s opened=%r",
+                    group_id,
+                    platform,
+                    opened,
+                )
+            return stream_id
 
         if target_type == "private":
             user_id = str(cfg.user_id or "").strip()
             if not user_id:
+                self.ctx.logger.warning("hold_on 通知 target_type=private 但 user_id 为空")
                 return ""
             found = await self.ctx.chat.get_stream_by_user_id(user_id=user_id, platform=platform)
             stream_id = self._pick_stream_id(found)
             if stream_id:
                 return stream_id
+            self.ctx.logger.info(
+                "hold_on 通知未找到已有私聊会话，尝试 open_session user_id=%s platform=%s found=%r",
+                user_id,
+                platform,
+                found,
+            )
             opened = await self.ctx.chat.open_session(
                 platform=platform,
                 chat_type="private",
                 user_id=user_id,
             )
-            return self._pick_stream_id(opened)
+            stream_id = self._pick_stream_id(opened)
+            if not stream_id:
+                self.ctx.logger.warning(
+                    "hold_on 通知无法解析私聊会话 user_id=%s platform=%s opened=%r",
+                    user_id,
+                    platform,
+                    opened,
+                )
+            return stream_id
 
         self.ctx.logger.warning("hold_on 未知 notify.target_type=%r", target_type)
         return ""
@@ -546,11 +579,18 @@ class HoldOnPlugin(MaiBotPlugin):
             "rpm_global": "全局限流",
             "rpm_provider": "厂商限流",
             "rpm_model": "模型限流",
+            "error_model": "模型错误禁用",
             "global_stop": "全局停模",
         }.get(kind, kind)
 
     async def _notify_events(self, events: List[PolicyEvent]) -> None:
-        if not events or not bool(self.config.notify.enabled):
+        if not events:
+            return
+        if not bool(self.config.notify.enabled):
+            self.ctx.logger.debug(
+                "hold_on 有策略事件但 notify.enabled=false，已跳过转发 events=%s",
+                [e.kind for e in events],
+            )
             return
         # 同批合并为一条，避免 RPM+全局停模连发两条
         lines = ["触发稍等策略："]
@@ -571,7 +611,14 @@ class HoldOnPlugin(MaiBotPlugin):
             self.ctx.logger.error("hold_on 解析通知目标失败: %s", exc, exc_info=True)
             return
         if not target:
-            self.ctx.logger.warning("hold_on 通知未配置有效目标，已跳过发送")
+            cfg = self.config.notify
+            self.ctx.logger.warning(
+                "hold_on 通知未配置有效目标，已跳过发送 target_type=%s group_id=%r user_id=%r stream_id=%r",
+                cfg.target_type,
+                cfg.group_id,
+                cfg.user_id,
+                cfg.stream_id,
+            )
             return
         try:
             sent = await self.ctx.send.text(outbound, target)

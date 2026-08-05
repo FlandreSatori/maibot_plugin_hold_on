@@ -27,7 +27,7 @@ class FeatureModels:
 class PolicyEvent:
     """策略新触发事件（用于通知转发，避免重复刷屏）。"""
 
-    kind: str  # rpm_global / rpm_provider / rpm_model / global_stop
+    kind: str  # rpm_global / rpm_provider / rpm_model / error_model / global_stop
     reason: str
     scope: str = ""
     key: str = ""
@@ -195,13 +195,14 @@ class HoldOnPolicy:
         message: str = "",
         retry_after: Optional[float] = None,
     ) -> List[PolicyEvent]:
-        """任意模型错误均禁用；若因此新触发全局停模则返回事件。"""
+        """任意模型错误均禁用；返回新触发的通知事件（错误禁用 / 全局停模）。"""
 
         model = str(model_name or "").strip()
         if not model:
             return []
         prov = str(provider or "").strip() or self.provider_of(model)
         self.register_model_provider(model, prov)
+        was_disabled = self.state.is_disabled("model", model)
         streak = self.state.bump_error_streak("model", model)
         seconds = self.compute_error_disable_seconds(streak, retry_after)
         detail = self._short(message) if message else "模型请求失败"
@@ -214,8 +215,16 @@ class HoldOnPolicy:
             source="error",
             error_streak=streak,
         )
+        events: List[PolicyEvent] = []
+        # 仅在「新进入禁用」时通知，避免连击延长时刷屏
+        if not was_disabled:
+            events.append(
+                PolicyEvent(kind="error_model", reason=reason, scope="model", key=model)
+            )
         kill = self._maybe_feature_kill()
-        return [kill] if kill is not None else []
+        if kill is not None:
+            events.append(kill)
+        return events
 
     def on_success(self, model_name: str) -> None:
         model = str(model_name or "").strip()

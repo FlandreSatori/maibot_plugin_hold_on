@@ -1,5 +1,11 @@
 # 更新日志
 
+## 1.3.2
+
+- 从 manifest 移除未使用的 `llm.get_available_models`（宿主该 API 仅返回任务名列表，不足以做厂商/功能模型发现；继续用 `tomllib` 读 `model_config.toml`）。
+- 修复通知转发：模型错误**新进入禁用**时也会发出事件（此前几乎只在「功能全灭 → 全局停模」时通知，日常错误禁用从不转发）。
+- 通知目标解析失败时日志更明确（空 `group_id` / 无法 open_session 等）。
+
 ## 1.3.1
 
 - 停用全局 RPM（配置项保留但强制为 0；总开关 `global_limit.enabled` 仍控制整套限流）。
