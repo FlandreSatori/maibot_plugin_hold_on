@@ -1,0 +1,278 @@
+"""限流 / 禁用 / 功能全灭策略。"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
+
+from .state import HoldOnState
+
+
+@dataclass(frozen=True)
+class NamedLimit:
+    name: str
+    max_requests_per_minute: int = 0
+    disable_seconds: int = 600
+    provider: str = ""
+
+
+@dataclass(frozen=True)
+class FeatureModels:
+    feature: str
+    models: Tuple[str, ...]
+
+
+class HoldOnPolicy:
+    """根据配置与状态判定是否拦截、禁用多久。"""
+
+    def __init__(
+        self,
+        state: HoldOnState,
+        *,
+        global_max_rpm: int,
+        global_disable_seconds: int,
+        provider_limits: Sequence[NamedLimit],
+        model_limits: Sequence[NamedLimit],
+        features: Sequence[FeatureModels],
+        error_base_seconds: int,
+        error_max_seconds: int,
+        error_exponential: bool,
+        error_multiplier: float,
+        feature_kill_enabled: bool,
+    ) -> None:
+        self.state = state
+        self.global_max_rpm = max(0, int(global_max_rpm or 0))
+        self.global_disable_seconds = max(0, int(global_disable_seconds or 0))
+        self.provider_limits = {p.name: p for p in provider_limits if p.name}
+        self.model_limits = {m.name: m for m in model_limits if m.name}
+        self.model_provider = {
+            m.name: m.provider for m in model_limits if m.name and m.provider
+        }
+        self.features = {f.feature: tuple(f.models) for f in features if f.feature}
+        self.error_base_seconds = max(1, int(error_base_seconds or 60))
+        self.error_max_seconds = max(self.error_base_seconds, int(error_max_seconds or 3600))
+        self.error_exponential = bool(error_exponential)
+        self.error_multiplier = max(1.0, float(error_multiplier or 2.0))
+        self.feature_kill_enabled = bool(feature_kill_enabled)
+
+    def provider_of(self, model_name: str) -> str:
+        name = str(model_name or "").strip()
+        if not name:
+            return ""
+        if name in self.model_provider:
+            return self.model_provider[name]
+        limit = self.model_limits.get(name)
+        return str(limit.provider or "").strip() if limit else ""
+
+    def register_model_provider(self, model_name: str, provider: str) -> None:
+        model = str(model_name or "").strip()
+        prov = str(provider or "").strip()
+        if model and prov and model not in self.model_provider:
+            self.model_provider[model] = prov
+
+    def is_model_blocked(self, model_name: str) -> bool:
+        name = str(model_name or "").strip()
+        if not name:
+            return False
+        if self.state.global_stop:
+            return True
+        if self.state.is_disabled("model", name):
+            return True
+        provider = self.provider_of(name)
+        if provider and self.state.is_disabled("provider", provider):
+            return True
+        if self.state.is_disabled("global", "all"):
+            return True
+        return False
+
+    def note_request(self, *, model_name: str = "", provider: str = "") -> Optional[str]:
+        """记录一次请求；若触达限流则禁用并返回原因。"""
+
+        if self.state.global_stop or self.state.is_disabled("global", "all"):
+            return "全局停模中"
+
+        model = str(model_name or "").strip()
+        prov = str(provider or "").strip() or self.provider_of(model)
+
+        if model and self.state.is_disabled("model", model):
+            entry = self.state.get_disable("model", model)
+            return entry.reason if entry else f"模型 {model} 已禁用"
+        if prov and self.state.is_disabled("provider", prov):
+            entry = self.state.get_disable("provider", prov)
+            return entry.reason if entry else f"厂商 {prov} 已禁用"
+
+        global_count = self.state.record_hit("global")
+        if self.global_max_rpm > 0 and global_count > self.global_max_rpm:
+            seconds = self.global_disable_seconds or 300
+            reason = f"全局 RPM 超限（{global_count}/{self.global_max_rpm}）"
+            self.state.set_disable(
+                scope="global",
+                key="all",
+                seconds=seconds,
+                reason=reason,
+                source="ratelimit",
+            )
+            self.state.set_global_stop(True, reason)
+            return reason
+
+        if prov:
+            plimit = self.provider_limits.get(prov)
+            if plimit and plimit.max_requests_per_minute > 0:
+                count = self.state.record_hit(f"provider:{prov}")
+                if count > plimit.max_requests_per_minute:
+                    seconds = plimit.disable_seconds or self.global_disable_seconds or 600
+                    reason = f"厂商 RPM 超限（{count}/{plimit.max_requests_per_minute}）"
+                    self.state.set_disable(
+                        scope="provider",
+                        key=prov,
+                        seconds=seconds,
+                        reason=reason,
+                        source="ratelimit",
+                    )
+                    self._maybe_feature_kill()
+                    return f"厂商 {prov} RPM 超限"
+
+        if model:
+            mlimit = self.model_limits.get(model)
+            if mlimit and mlimit.max_requests_per_minute > 0:
+                count = self.state.record_hit(f"model:{model}")
+                if count > mlimit.max_requests_per_minute:
+                    seconds = mlimit.disable_seconds or self.global_disable_seconds or 900
+                    reason = f"模型 RPM 超限（{count}/{mlimit.max_requests_per_minute}）"
+                    self.state.set_disable(
+                        scope="model",
+                        key=model,
+                        seconds=seconds,
+                        reason=reason,
+                        source="ratelimit",
+                        error_streak=0,
+                    )
+                    self._maybe_feature_kill()
+                    return f"模型 {model} RPM 超限"
+            else:
+                self.state.record_hit(f"model:{model}")
+
+        return None
+
+    def compute_error_disable_seconds(self, streak: int, retry_after: Optional[float] = None) -> float:
+        streak = max(1, int(streak or 1))
+        if self.error_exponential:
+            seconds = self.error_base_seconds * math.pow(self.error_multiplier, streak - 1)
+        else:
+            seconds = float(self.error_base_seconds)
+        seconds = min(float(self.error_max_seconds), float(seconds))
+        if retry_after is not None:
+            try:
+                seconds = max(seconds, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+        return seconds
+
+    def disable_for_error(
+        self,
+        *,
+        model_name: str,
+        provider: str = "",
+        message: str = "",
+        retry_after: Optional[float] = None,
+    ) -> Optional[str]:
+        """任意模型错误均禁用，不区分错误类型。"""
+
+        model = str(model_name or "").strip()
+        if not model:
+            return None
+        prov = str(provider or "").strip() or self.provider_of(model)
+        self.register_model_provider(model, prov)
+        streak = self.state.bump_error_streak("model", model)
+        seconds = self.compute_error_disable_seconds(streak, retry_after)
+        detail = self._short(message) if message else "模型请求失败"
+        reason = f"模型错误（第 {streak} 次）: {detail}"
+        self.state.set_disable(
+            scope="model",
+            key=model,
+            seconds=seconds,
+            reason=reason,
+            source="error",
+            error_streak=streak,
+        )
+        self._maybe_feature_kill()
+        return reason
+
+    def on_success(self, model_name: str) -> None:
+        model = str(model_name or "").strip()
+        if model:
+            self.state.reset_error_streak("model", model)
+
+    def _maybe_feature_kill(self) -> None:
+        if not self.feature_kill_enabled or not self.features:
+            return
+        for feature, models in self.features.items():
+            names = [m for m in models if str(m).strip()]
+            if not names:
+                continue
+            if all(self.state.is_disabled("model", m) for m in names):
+                reason = f"功能 {feature} 的全部模型均已禁用: {', '.join(names)}"
+                self.state.set_global_stop(True, reason)
+                self.state.set_disable(
+                    scope="global",
+                    key="all",
+                    seconds=self.global_disable_seconds or 300,
+                    reason=reason,
+                    source="feature_kill",
+                )
+                return
+
+    def refresh_feature_kill(self) -> None:
+        if not self.state.global_stop:
+            return
+        source_entry = self.state.get_disable("global", "all")
+        if source_entry and source_entry.source not in ("feature_kill", "ratelimit", ""):
+            return
+        if self.feature_kill_enabled and self.features:
+            for _feature, models in self.features.items():
+                names = [m for m in models if str(m).strip()]
+                if names and all(self.state.is_disabled("model", m) for m in names):
+                    return
+        if self.state.is_disabled("global", "all"):
+            return
+        if source_entry is None or not source_entry.is_active():
+            self.state.set_global_stop(False)
+
+    def any_configured_models_available(self) -> bool:
+        """若配置了 feature 模型，是否仍有任一可用。"""
+
+        names: List[str] = []
+        for models in self.features.values():
+            names.extend(m for m in models if m)
+        if not names:
+            return True
+        return any(not self.is_model_blocked(m) for m in names)
+
+    @staticmethod
+    def _short(text: str, limit: int = 160) -> str:
+        normalized = " ".join(str(text or "").split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[:limit] + "…"
+
+    def status_text(self) -> str:
+        self.refresh_feature_kill()
+        snap = self.state.snapshot()
+        lines = ["【稍等状态】"]
+        if snap["global_stop"]:
+            lines.append(f"全局停模: 是（{snap['global_stop_reason'] or '无原因'}）")
+        else:
+            lines.append("全局停模: 否")
+        disables = snap.get("disables") or []
+        if not disables:
+            lines.append("当前无禁用项。")
+            return "\n".join(lines)
+        lines.append(f"禁用项（{len(disables)}）:")
+        for item in disables:
+            rem = item.get("remaining_seconds", 0)
+            lines.append(
+                f"- [{item.get('scope')}] {item.get('key')} "
+                f"剩余 {rem}s | source={item.get('source')} | {item.get('reason')}"
+            )
+        return "\n".join(lines)

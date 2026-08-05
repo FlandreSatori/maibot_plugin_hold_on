@@ -1,0 +1,39 @@
+{
+  "manifest_version": 2,
+  "version": "1.2.1",
+  "name": "稍，稍等一下！",
+  "description": "纯插件限流与错误禁用：按全局/厂商/模型控制 RPM；监听到模型失败快照即禁用；功能模型全灭时 abort 入站；加载时可自动同步宿主启用模型。",
+  "author": {
+    "name": "FlandreSatori",
+    "url": "https://github.com/FlandreSatori"
+  },
+  "license": "AGPL-3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/FlandreSatori/maibot_plugin_hold_on",
+    "homepage": "https://github.com/FlandreSatori/maibot_plugin_hold_on",
+    "issues": "https://github.com/FlandreSatori/maibot_plugin_hold_on/issues"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "config.get",
+    "llm.get_available_models"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "maibot_plugin.hold_on"
+}
