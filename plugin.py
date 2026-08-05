@@ -1,6 +1,5 @@
-"""稍，稍等一下！（hold_on）— 纯插件限流 / 错误禁用 / 全局停模。
-
-不改 MaiBot 宿主。全局停模仅 abort 入站（放行命令与已被其他插件截获的消息）。
+"""
+稍，稍等一下！（hold_on）
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ class PluginSectionConfig(PluginConfigBase):
     config_version: str = Field(default="1.2.1", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
-        description="加载时自动检测宿主启用模型，并同步 limits / feature_kill.features",
+        description="加载时自动检测启用模型，保留同名模型的配置",
     )
     model_config_path: str = Field(
         default="",
@@ -54,7 +53,7 @@ class GlobalConfig(PluginConfigBase):
 
 
 class ProviderLimitConfig(PluginConfigBase):
-    __ui_label__ = "厂商限流项"
+    __ui_label__ = "厂商限流"
     __ui_icon__ = "server"
     __ui_order__ = 0
 
@@ -64,12 +63,12 @@ class ProviderLimitConfig(PluginConfigBase):
 
 
 class ModelLimitConfig(PluginConfigBase):
-    __ui_label__ = "模型限流项"
+    __ui_label__ = "模型限流"
     __ui_icon__ = "cpu"
     __ui_order__ = 0
 
-    name: str = Field(default="", description="逻辑模型名")
-    provider: str = Field(default="", description="所属厂商名")
+    name: str = Field(default="", description="模型名")
+    provider: str = Field(default="", description="厂商名")
     max_requests_per_minute: int = Field(default=0, description="每分钟上限（0=不限）")
     disable_seconds: int = Field(default=900, description="超限禁用秒数")
 
@@ -105,11 +104,11 @@ class FeatureModelsConfig(PluginConfigBase):
 
 
 class FeatureKillConfig(PluginConfigBase):
-    __ui_label__ = "功能全灭停模"
+    __ui_label__ = "功能停用触发全局停用"
     __ui_icon__ = "shield-off"
     __ui_order__ = 4
 
-    enabled: bool = Field(default=True, description="某功能模型全部禁用时触发全局停模")
+    enabled: bool = Field(default=True, description="某项功能下所有模型错误时，全局禁用LLM")
     features: list[FeatureModelsConfig] = Field(
         default_factory=list,
         description="功能→模型列表；开启 auto_detect_models 时每次加载自动同步",

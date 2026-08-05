@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.2.1",
+  "version": "1.2.2",
   "name": "稍，稍等一下！",
-  "description": "纯插件限流与错误禁用：按全局/厂商/模型控制 RPM；监听到模型失败快照即禁用；功能模型全灭时 abort 入站；加载时可自动同步宿主启用模型。",
+  "description": "为模型提供RateLimit",
   "author": {
     "name": "FlandreSatori",
     "url": "https://github.com/FlandreSatori"
