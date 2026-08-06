@@ -34,7 +34,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.0.2", description="配置版本")
+    config_version: str = Field(default="2.0.3", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
         description="加载时从宿主 model_config.toml 同步",
@@ -263,7 +263,7 @@ class HoldOnPlugin(MaiBotPlugin):
         return {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "2.0.2",
+                "config_version": "2.0.3",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
@@ -361,7 +361,7 @@ class HoldOnPlugin(MaiBotPlugin):
         """宿主 llm_usage → REQ_CNT_BY_MODEL（与 maibot_statistic 同源）。"""
 
         return await fetch_req_cnt_by_model(
-            self.ctx.database,
+            self.ctx.db,
             window_seconds=float(self.config.stats.window_seconds or 600),
             limit=int(self.config.stats.usage_fetch_limit or 10000),
             logger=self.ctx.logger,

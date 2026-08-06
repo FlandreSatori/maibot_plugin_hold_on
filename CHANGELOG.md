@@ -1,5 +1,9 @@
 # 更新日志
 
+## 2.0.3
+
+- 修复 `/稍等`：成功次数改为 `self.ctx.db`（SDK 无 `ctx.database`）。
+
 ## 2.0.2
 
 - 清理遗留兜底：去掉本地 success 计数、旧快照顶层 error、`llm_request` 监听、v1 配置合并等。
