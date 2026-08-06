@@ -122,42 +122,36 @@ def discover_models(extra_paths: Sequence[str] | None = None) -> Optional[Discov
         return None
 
 
-def discovery_to_config_sections(
-    result: DiscoveryResult,
-    *,
-    default_model_rpm: int = 10,
-    default_model_disable: int = 90,
-    default_provider_rpm: int = 30,
-    default_provider_disable: int = 90,
-) -> Dict[str, Any]:
-    """转为可写入 config.toml / 内存配置的结构。"""
+def discovery_to_config_sections(result: DiscoveryResult) -> Dict[str, Any]:
+    """转为 catalog：模型↔厂商 + 功能→模型列表。"""
 
     return {
-        "limits": {
-            "providers": [
-                {
-                    "name": name,
-                    "max_requests_per_minute": default_provider_rpm,
-                    "disable_seconds": default_provider_disable,
-                }
-                for name in result.providers
-            ],
+        "catalog": {
             "models": [
-                {
-                    "name": m.name,
-                    "provider": m.provider,
-                    "max_requests_per_minute": default_model_rpm,
-                    "disable_seconds": default_model_disable,
-                }
-                for m in result.models
+                {"name": m.name, "provider": m.provider} for m in result.models if m.name
             ],
-        },
-        "feature_kill": {
             "features": [
                 {"feature": f.feature, "models": list(f.models)} for f in result.features
             ],
         },
     }
+
+
+def merge_discovery_into_config_dict(
+    existing: Dict[str, Any],
+    sections: Dict[str, Any],
+) -> Dict[str, Any]:
+    """用发现结果覆盖 catalog（保留其余段）。"""
+
+    out = dict(existing or {})
+    catalog = out.setdefault("catalog", {})
+    if not isinstance(catalog, dict):
+        catalog = {}
+        out["catalog"] = catalog
+    discovered = sections.get("catalog") or {}
+    catalog["models"] = list(discovered.get("models") or [])
+    catalog["features"] = list(discovered.get("features") or [])
+    return out
 
 
 def write_simple_toml(path: Path, data: Dict[str, Any]) -> None:
@@ -222,28 +216,3 @@ def write_simple_toml(path: Path, data: Dict[str, Any]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-
-def merge_discovery_into_config_dict(
-    existing: Dict[str, Any],
-    sections: Dict[str, Any],
-) -> Dict[str, Any]:
-    """用发现结果覆盖 limits / feature_kill.features（保留其余段）。"""
-
-    out = dict(existing or {})
-    limits = out.setdefault("limits", {})
-    if not isinstance(limits, dict):
-        limits = {}
-        out["limits"] = limits
-    limits["models"] = sections.get("limits", {}).get("models", [])
-    limits["providers"] = sections.get("limits", {}).get("providers", [])
-
-    feature_kill = out.setdefault("feature_kill", {})
-    if not isinstance(feature_kill, dict):
-        feature_kill = {}
-        out["feature_kill"] = feature_kill
-    feature_kill["features"] = sections.get("feature_kill", {}).get("features", [])
-    if "enabled" not in feature_kill:
-        feature_kill["enabled"] = True
-
-    return out

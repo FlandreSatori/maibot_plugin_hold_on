@@ -1,5 +1,7 @@
 """
 稍，稍等一下！（hold_on）
+
+统计模型出错率；按模型/厂商/功能 + 错误类型阈值在 LATE 阶段 abort。
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from .modules.model_discover import (
     discovery_to_config_sections,
     write_simple_toml,
 )
-from .modules.policy import FeatureModels, HoldOnPolicy, NamedLimit, PolicyEvent
+from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
 from .modules.state import HoldOnState
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -31,10 +33,10 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.3.2", description="配置版本")
+    config_version: str = Field(default="2.0.0", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
-        description="加载时自动检测启用模型，保留同名模型的配置",
+        description="加载时从宿主 model_config.toml 同步",
     )
     model_config_path: str = Field(
         default="",
@@ -42,67 +44,28 @@ class PluginSectionConfig(PluginConfigBase):
     )
 
 
-class GlobalConfig(PluginConfigBase):
-    __ui_label__ = "全局限流"
-    __ui_icon__ = "gauge"
+class StatsConfig(PluginConfigBase):
+    __ui_label__ = "统计"
+    __ui_icon__ = "bar-chart-2"
     __ui_order__ = 1
 
-    enabled: bool = Field(default=True, description="是否启用限流与禁用逻辑（总开关）")
-    # 全局 RPM 无实际意义，默认关闭；
-    max_requests_per_minute: int = Field(
-        default=0,
-        description="【已弃用】全局每分钟请求上限；请保持 0，改用厂商/模型 RPM",
-    )
-    disable_seconds: int = Field(
-        default=90,
-        description="全局禁用秒数",
+    window_seconds: int = Field(
+        default=600,
+        description="/稍等 展示的统计窗口秒数",
     )
 
 
-class ProviderLimitConfig(PluginConfigBase):
-    __ui_label__ = "厂商限流"
-    __ui_icon__ = "server"
-    __ui_order__ = 0
-
-    name: str = Field(default="", description="厂商名")
-    max_requests_per_minute: int = Field(default=30, description="每分钟上限（0=不限）")
-    disable_seconds: int = Field(default=90, description="超限禁用秒数")
-
-
-class ModelLimitConfig(PluginConfigBase):
-    __ui_label__ = "模型限流"
+class CatalogModelConfig(PluginConfigBase):
+    __ui_label__ = "模型"
     __ui_icon__ = "cpu"
     __ui_order__ = 0
 
-    name: str = Field(default="", description="模型名")
+    name: str = Field(default="", description="逻辑模型名")
     provider: str = Field(default="", description="厂商名")
-    max_requests_per_minute: int = Field(default=10, description="每分钟上限（0=不限）")
-    disable_seconds: int = Field(default=90, description="超限禁用秒数")
 
 
-class LimitsConfig(PluginConfigBase):
-    __ui_label__ = "厂商与模型限流"
-    __ui_icon__ = "sliders"
-    __ui_order__ = 2
-
-    providers: list[ProviderLimitConfig] = Field(default_factory=list, description="厂商限流列表")
-    models: list[ModelLimitConfig] = Field(default_factory=list, description="模型限流列表")
-
-
-class ErrorDisableConfig(PluginConfigBase):
-    __ui_label__ = "错误自动禁用"
-    __ui_icon__ = "alert-triangle"
-    __ui_order__ = 3
-
-    enabled: bool = Field(default=True, description="监听到模型失败快照即禁用该模型（不区分错误类型）")
-    base_seconds: int = Field(default=60, description="首次错误禁用秒数")
-    max_seconds: int = Field(default=3600, description="指数退避封顶秒数")
-    exponential: bool = Field(default=True, description="是否指数退避")
-    multiplier: float = Field(default=2.0, description="指数倍率")
-
-
-class FeatureModelsConfig(PluginConfigBase):
-    __ui_label__ = "功能模型组"
+class CatalogFeatureConfig(PluginConfigBase):
+    __ui_label__ = "功能"
     __ui_icon__ = "layers"
     __ui_order__ = 0
 
@@ -110,22 +73,58 @@ class FeatureModelsConfig(PluginConfigBase):
     models: list[str] = Field(default_factory=list, description="该功能使用的逻辑模型列表")
 
 
-class FeatureKillConfig(PluginConfigBase):
-    __ui_label__ = "功能停用触发全局停用"
-    __ui_icon__ = "shield-off"
-    __ui_order__ = 4
+class CatalogConfig(PluginConfigBase):
+    __ui_label__ = "模型目录"
+    __ui_icon__ = "book"
+    __ui_order__ = 2
 
-    enabled: bool = Field(default=True, description="某项功能下所有模型错误时，全局禁用LLM")
-    features: list[FeatureModelsConfig] = Field(
+    models: list[CatalogModelConfig] = Field(
         default_factory=list,
-        description="功能→模型列表；开启 auto_detect_models 时每次加载自动同步",
+        description="模型↔厂商；auto_detect_models 时自动同步",
+    )
+    features: list[CatalogFeatureConfig] = Field(
+        default_factory=list,
+        description="功能→模型；用于 scope=feature 的规则",
+    )
+
+
+class ThresholdRuleConfig(PluginConfigBase):
+    __ui_label__ = "阈值规则"
+    __ui_icon__ = "filter"
+    __ui_order__ = 0
+
+    scope: str = Field(
+        default="model",
+        description="计数范围：model / provider / feature",
+    )
+    name: str = Field(
+        default="",
+        description="目标名；空表示该 scope 下按实际命中目标各自计数",
+    )
+    error_type: str = Field(
+        default="*",
+        description="错误类型：429 / 502 / 5xx / timeout / * 等",
+    )
+    window_seconds: int = Field(default=60, description="滑动窗口秒数")
+    threshold: int = Field(default=5, description="窗口内达到该次数则停模")
+    hold_seconds: int = Field(default=90, description="触发后停模秒数")
+
+
+class RulesConfig(PluginConfigBase):
+    __ui_label__ = "全局停止"
+    __ui_icon__ = "shield-off"
+    __ui_order__ = 3
+
+    items: list[ThresholdRuleConfig] = Field(
+        default_factory=list,
+        description="错误阈值规则列表",
     )
 
 
 class ErrorWatchConfig(PluginConfigBase):
     __ui_label__ = "错误快照监听"
     __ui_icon__ = "eye"
-    __ui_order__ = 5
+    __ui_order__ = 4
 
     enabled: bool = Field(default=True, description="监听宿主失败快照 JSON")
     interval_seconds: float = Field(default=2.0, description="扫描间隔秒")
@@ -136,13 +135,11 @@ class ErrorWatchConfig(PluginConfigBase):
 
 
 class NotifyConfig(PluginConfigBase):
-    """RPM / 全局禁用触发时转发通知（参考 redirect_err）。"""
-
     __ui_label__ = "通知转发"
     __ui_icon__ = "corner-up-right"
-    __ui_order__ = 6
+    __ui_order__ = 5
 
-    enabled: bool = Field(default=False, description="触发 RPM 或新进入全局停模时是否转发到指定会话")
+    enabled: bool = Field(default=False, description="触发全局停止时是否转发到指定会话")
     target_type: str = Field(
         default="group",
         description="目标类型：group / private / stream_id",
@@ -157,7 +154,7 @@ class NotifyConfig(PluginConfigBase):
 class PermissionConfig(PluginConfigBase):
     __ui_label__ = "权限"
     __ui_icon__ = "shield"
-    __ui_order__ = 7
+    __ui_order__ = 6
 
     whitelist: list[str] = Field(default_factory=list, description="管理命令白名单 user_id 或 platform:user_id")
     notify_permission_denied: bool = Field(default=True, description="无权限时是否提示")
@@ -165,10 +162,9 @@ class PermissionConfig(PluginConfigBase):
 
 class HoldOnConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    global_limit: GlobalConfig = Field(default_factory=GlobalConfig)
-    limits: LimitsConfig = Field(default_factory=LimitsConfig)
-    error_disable: ErrorDisableConfig = Field(default_factory=ErrorDisableConfig)
-    feature_kill: FeatureKillConfig = Field(default_factory=FeatureKillConfig)
+    stats: StatsConfig = Field(default_factory=StatsConfig)
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
+    rules: RulesConfig = Field(default_factory=RulesConfig)
     error_watch: ErrorWatchConfig = Field(default_factory=ErrorWatchConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     permission: PermissionConfig = Field(default_factory=PermissionConfig)
@@ -184,7 +180,7 @@ class HoldOnPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
-        await self._maybe_auto_fill_models()
+        await self._maybe_auto_fill_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
         self._last_selected_model: Dict[str, str] = {}
@@ -200,11 +196,11 @@ class HoldOnPlugin(MaiBotPlugin):
             self._watcher.start()
 
         self.ctx.logger.info(
-            "hold_on 已加载：enabled=%s provider_limits=%s model_limits=%s features=%s",
+            "hold_on 已加载：enabled=%s rules=%s models=%s features=%s",
             bool(self.config.plugin.enabled),
-            len(self.config.limits.providers or []),
-            len(self.config.limits.models or []),
-            [f.feature for f in (self.config.feature_kill.features or []) if f.feature],
+            len(self.config.rules.items or []),
+            len(self.config.catalog.models or []),
+            [f.feature for f in (self.config.catalog.features or []) if f.feature],
         )
 
     async def on_unload(self) -> None:
@@ -217,9 +213,7 @@ class HoldOnPlugin(MaiBotPlugin):
         self.policy = self._build_policy()
         self.ctx.logger.info("hold_on 配置已更新")
 
-    async def _maybe_auto_fill_models(self) -> None:
-        """加载时按宿主 model_config 同步启用模型列表。"""
-
+    async def _maybe_auto_fill_catalog(self) -> None:
         if not bool(self.config.plugin.auto_detect_models):
             return
 
@@ -231,148 +225,70 @@ class HoldOnPlugin(MaiBotPlugin):
             self.ctx.logger.warning("hold_on 未找到 model_config.toml，跳过自动检测")
             return
 
-        sections = discovery_to_config_sections(
-            result,
-            default_model_rpm=10,
-            default_model_disable=90,
-            default_provider_rpm=30,
-            default_provider_disable=90,
-        )
-        prev_models = {
-            str(m.name).strip(): m for m in (self.config.limits.models or []) if str(m.name or "").strip()
-        }
-        prev_providers = {
-            str(p.name).strip(): p for p in (self.config.limits.providers or []) if str(p.name or "").strip()
-        }
-
-        self.config.limits.models = []
-        for item in sections["limits"]["models"]:
-            name = str(item.get("name") or "").strip()
-            if not name:
-                continue
-            old = prev_models.get(name)
-            self.config.limits.models.append(
-                ModelLimitConfig(
-                    name=name,
-                    provider=str(item.get("provider") or (old.provider if old else "") or ""),
-                    max_requests_per_minute=int(
-                        old.max_requests_per_minute
-                        if old is not None
-                        else item.get("max_requests_per_minute") or 10
-                    ),
-                    disable_seconds=int(
-                        old.disable_seconds if old is not None else item.get("disable_seconds") or 90
-                    ),
-                )
+        sections = discovery_to_config_sections(result)
+        self.config.catalog.models = [
+            CatalogModelConfig(
+                name=str(item.get("name") or "").strip(),
+                provider=str(item.get("provider") or "").strip(),
             )
-
-        self.config.limits.providers = []
-        for item in sections["limits"]["providers"]:
-            name = str(item.get("name") or "").strip()
-            if not name:
-                continue
-            old = prev_providers.get(name)
-            self.config.limits.providers.append(
-                ProviderLimitConfig(
-                    name=name,
-                    max_requests_per_minute=int(
-                        old.max_requests_per_minute
-                        if old is not None
-                        else item.get("max_requests_per_minute") or 30
-                    ),
-                    disable_seconds=int(
-                        old.disable_seconds if old is not None else item.get("disable_seconds") or 90
-                    ),
-                )
-            )
-
-        self.config.feature_kill.features = [
-            FeatureModelsConfig(
-                feature=str(item.get("feature") or ""),
+            for item in sections["catalog"]["models"]
+            if str(item.get("name") or "").strip()
+        ]
+        self.config.catalog.features = [
+            CatalogFeatureConfig(
+                feature=str(item.get("feature") or "").strip(),
                 models=list(item.get("models") or []),
             )
-            for item in sections["feature_kill"]["features"]
+            for item in sections["catalog"]["features"]
             if str(item.get("feature") or "").strip()
         ]
 
         try:
-            self._persist_auto_filled_config()
+            self._persist_config()
         except Exception as exc:
             self.ctx.logger.warning("hold_on 自动检测配置写盘失败: %s", exc)
 
         self.ctx.logger.info(
-            "hold_on 已同步启用模型：source=%s models=%s features=%s",
+            "hold_on 已同步 catalog：source=%s models=%s features=%s",
             result.source_path,
-            len(self.config.limits.models or []),
-            [f.feature for f in (self.config.feature_kill.features or [])],
+            len(self.config.catalog.models or []),
+            [f.feature for f in (self.config.catalog.features or [])],
         )
 
-    def _persist_auto_filled_config(self) -> None:
-        """把当前内存中的同步结果写回插件目录 config.toml。"""
-
-        config_path = PLUGIN_DIR / "config.toml"
-        existing: Dict[str, Any] = {}
-        if config_path.exists():
-            try:
-                import tomllib
-
-                existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
-
-        # 去掉已废弃字段，避免写回干扰
-        plugin_existing = existing.get("plugin") if isinstance(existing.get("plugin"), dict) else {}
-        plugin_existing.pop("models_auto_filled", None)
-
-        payload = {
+    def _config_payload(self) -> Dict[str, Any]:
+        return {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "1.3.2",
+                "config_version": "2.0.0",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
-            "global_limit": {
-                "enabled": bool(self.config.global_limit.enabled),
-                # 全局 RPM 已停用，写盘固定为 0
-                "max_requests_per_minute": 0,
-                "disable_seconds": int(self.config.global_limit.disable_seconds or 90),
+            "stats": {
+                "window_seconds": int(self.config.stats.window_seconds or 600),
             },
-            "limits": {
-                "providers": [
-                    {
-                        "name": p.name,
-                        "max_requests_per_minute": int(p.max_requests_per_minute or 0),
-                        "disable_seconds": int(p.disable_seconds or 90),
-                    }
-                    for p in (self.config.limits.providers or [])
-                    if p.name
-                ],
+            "catalog": {
                 "models": [
-                    {
-                        "name": m.name,
-                        "provider": m.provider,
-                        "max_requests_per_minute": int(m.max_requests_per_minute or 0),
-                        "disable_seconds": int(m.disable_seconds or 90),
-                    }
-                    for m in (self.config.limits.models or [])
+                    {"name": m.name, "provider": m.provider}
+                    for m in (self.config.catalog.models or [])
                     if m.name
                 ],
-            },
-            "error_disable": {
-                "enabled": bool(self.config.error_disable.enabled),
-                "base_seconds": int(self.config.error_disable.base_seconds or 60),
-                "max_seconds": int(self.config.error_disable.max_seconds or 3600),
-                "exponential": bool(self.config.error_disable.exponential),
-                "multiplier": float(self.config.error_disable.multiplier or 2.0),
-            },
-            "feature_kill": {
-                "enabled": bool(self.config.feature_kill.enabled),
                 "features": [
                     {"feature": f.feature, "models": list(f.models or [])}
-                    for f in (self.config.feature_kill.features or [])
+                    for f in (self.config.catalog.features or [])
                     if f.feature
+                ],
+            },
+            "rules": {
+                "items": [
+                    {
+                        "scope": str(r.scope or "model"),
+                        "name": str(r.name or ""),
+                        "error_type": str(r.error_type or "*"),
+                        "window_seconds": int(r.window_seconds or 60),
+                        "threshold": int(r.threshold or 0),
+                        "hold_seconds": int(r.hold_seconds or 90),
+                    }
+                    for r in (self.config.rules.items or [])
                 ],
             },
             "error_watch": {
@@ -394,61 +310,65 @@ class HoldOnPlugin(MaiBotPlugin):
                 "notify_permission_denied": bool(self.config.permission.notify_permission_denied),
             },
         }
-        # 保留 existing 中本插件未管理的顶层键（若有）
+
+    def _persist_config(self) -> None:
+        config_path = PLUGIN_DIR / "config.toml"
+        existing: Dict[str, Any] = {}
+        if config_path.exists():
+            try:
+                import tomllib
+
+                existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        payload = self._config_payload()
+        # 丢弃 v1 遗留段
+        for obsolete in ("global_limit", "limits", "error_disable", "feature_kill"):
+            existing.pop(obsolete, None)
         for key, value in existing.items():
             if key not in payload:
                 payload[key] = value
         write_simple_toml(config_path, payload)
 
     def _build_policy(self) -> HoldOnPolicy:
-        providers = [
-            NamedLimit(
-                name=str(p.name or "").strip(),
-                max_requests_per_minute=int(p.max_requests_per_minute or 0),
-                disable_seconds=int(p.disable_seconds or 90),
+        rules = [
+            ThresholdRule(
+                scope=str(r.scope or "model").strip().lower() or "model",
+                name=str(r.name or "").strip(),
+                error_type=str(r.error_type or "*").strip() or "*",
+                window_seconds=int(r.window_seconds or 60),
+                threshold=int(r.threshold or 0),
+                hold_seconds=int(r.hold_seconds or 90),
             )
-            for p in (self.config.limits.providers or [])
-            if str(p.name or "").strip()
-        ]
-        models = [
-            NamedLimit(
-                name=str(m.name or "").strip(),
-                provider=str(m.provider or "").strip(),
-                max_requests_per_minute=int(m.max_requests_per_minute or 0),
-                disable_seconds=int(m.disable_seconds or 90),
-            )
-            for m in (self.config.limits.models or [])
-            if str(m.name or "").strip()
+            for r in (self.config.rules.items or [])
+            if int(r.threshold or 0) > 0
         ]
         features = [
             FeatureModels(
                 feature=str(f.feature or "").strip(),
                 models=tuple(str(x).strip() for x in (f.models or []) if str(x).strip()),
             )
-            for f in (self.config.feature_kill.features or [])
+            for f in (self.config.catalog.features or [])
             if str(f.feature or "").strip()
         ]
+        model_providers = {
+            str(m.name).strip(): str(m.provider or "").strip()
+            for m in (self.config.catalog.models or [])
+            if str(m.name or "").strip()
+        }
         return HoldOnPolicy(
             self.state,
-            # 全局 RPM 已停用：始终按 0 处理，避免旧配置误伤
-            global_max_rpm=0,
-            global_disable_seconds=int(self.config.global_limit.disable_seconds or 90),
-            provider_limits=providers,
-            model_limits=models,
+            rules=rules,
             features=features,
-            error_base_seconds=int(self.config.error_disable.base_seconds or 60),
-            error_max_seconds=int(self.config.error_disable.max_seconds or 3600),
-            error_exponential=bool(self.config.error_disable.exponential),
-            error_multiplier=float(self.config.error_disable.multiplier or 2.0),
-            feature_kill_enabled=bool(self.config.feature_kill.enabled),
+            model_providers=model_providers,
+            stats_window_seconds=int(self.config.stats.window_seconds or 600),
         )
 
     def _active(self) -> bool:
-        return bool(self.config.plugin.enabled) and bool(self.config.global_limit.enabled)
-
-    def _should_global_stop(self) -> bool:
-        self.policy.refresh_feature_kill()
-        return bool(self.state.global_stop or self.state.is_disabled("global", "all"))
+        return bool(self.config.plugin.enabled)
 
     async def _on_snapshot_error(
         self,
@@ -456,26 +376,32 @@ class HoldOnPlugin(MaiBotPlugin):
         model_name: str = "",
         provider: str = "",
         message: str = "",
-        retry_after: Optional[float] = None,
+        error_type: str = "",
+        error: Optional[dict] = None,
+        payload: Optional[dict] = None,
         source_path: str = "",
         **_: Any,
     ) -> None:
-        if not self._active() or not bool(self.config.error_disable.enabled):
+        if not self._active():
             return
-        events = self.policy.disable_for_error(
+        event = self.policy.on_error(
             model_name=model_name,
             provider=provider,
             message=message,
-            retry_after=retry_after,
+            error_type=error_type,
+            error=error,
+            payload=payload,
         )
         self.ctx.logger.warning(
-            "hold_on 错误禁用：model=%s provider=%s path=%s events=%s",
+            "hold_on 记录错误：model=%s provider=%s type=%s path=%s hold=%s",
             model_name,
             provider,
+            error_type,
             Path(source_path).name if source_path else "",
-            [e.kind for e in events],
+            bool(event),
         )
-        await self._notify_events(events)
+        if event is not None:
+            await self._notify_hold(event)
 
     # ─── 通知转发 ────────────────────────────────────────────────
 
@@ -519,26 +445,12 @@ class HoldOnPlugin(MaiBotPlugin):
             stream_id = self._pick_stream_id(found)
             if stream_id:
                 return stream_id
-            self.ctx.logger.info(
-                "hold_on 通知未找到已有群会话，尝试 open_session group_id=%s platform=%s found=%r",
-                group_id,
-                platform,
-                found,
-            )
             opened = await self.ctx.chat.open_session(
                 platform=platform,
                 chat_type="group",
                 group_id=group_id,
             )
-            stream_id = self._pick_stream_id(opened)
-            if not stream_id:
-                self.ctx.logger.warning(
-                    "hold_on 通知无法解析群会话 group_id=%s platform=%s opened=%r",
-                    group_id,
-                    platform,
-                    opened,
-                )
-            return stream_id
+            return self._pick_stream_id(opened)
 
         if target_type == "private":
             user_id = str(cfg.user_id or "").strip()
@@ -549,62 +461,29 @@ class HoldOnPlugin(MaiBotPlugin):
             stream_id = self._pick_stream_id(found)
             if stream_id:
                 return stream_id
-            self.ctx.logger.info(
-                "hold_on 通知未找到已有私聊会话，尝试 open_session user_id=%s platform=%s found=%r",
-                user_id,
-                platform,
-                found,
-            )
             opened = await self.ctx.chat.open_session(
                 platform=platform,
                 chat_type="private",
                 user_id=user_id,
             )
-            stream_id = self._pick_stream_id(opened)
-            if not stream_id:
-                self.ctx.logger.warning(
-                    "hold_on 通知无法解析私聊会话 user_id=%s platform=%s opened=%r",
-                    user_id,
-                    platform,
-                    opened,
-                )
-            return stream_id
+            return self._pick_stream_id(opened)
 
         self.ctx.logger.warning("hold_on 未知 notify.target_type=%r", target_type)
         return ""
 
-    @staticmethod
-    def _event_label(kind: str) -> str:
-        return {
-            "rpm_global": "全局限流",
-            "rpm_provider": "厂商限流",
-            "rpm_model": "模型限流",
-            "error_model": "模型错误禁用",
-            "global_stop": "全局停模",
-        }.get(kind, kind)
-
-    async def _notify_events(self, events: List[PolicyEvent]) -> None:
-        if not events:
-            return
+    async def _notify_hold(self, event: HoldEvent) -> None:
         if not bool(self.config.notify.enabled):
-            self.ctx.logger.debug(
-                "hold_on 有策略事件但 notify.enabled=false，已跳过转发 events=%s",
-                [e.kind for e in events],
-            )
+            self.ctx.logger.debug("hold_on 新停模但 notify.enabled=false，已跳过转发")
             return
-        # 同批合并为一条，避免 RPM+全局停模连发两条
-        lines = ["触发稍等策略："]
-        seen: set[str] = set()
-        for event in events:
-            key = f"{event.kind}:{event.reason}"
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(f"- [{self._event_label(event.kind)}] {event.reason}")
-        text = "\n".join(lines)
+        text = (
+            f"触发稍等停模：\n"
+            f"- [{event.scope}:{event.name or '*'}] "
+            f"类型 {event.error_type or '*'} "
+            f"{event.count}/{event.threshold} @ {event.window_seconds}s\n"
+            f"- {event.reason}"
+        )
         prefix = str(self.config.notify.prefix or "")
         outbound = f"{prefix}{text}" if prefix else text
-
         try:
             target = await self._resolve_notify_stream_id()
         except Exception as exc:
@@ -613,11 +492,9 @@ class HoldOnPlugin(MaiBotPlugin):
         if not target:
             cfg = self.config.notify
             self.ctx.logger.warning(
-                "hold_on 通知未配置有效目标，已跳过发送 target_type=%s group_id=%r user_id=%r stream_id=%r",
+                "hold_on 通知未配置有效目标 target_type=%s group_id=%r",
                 cfg.target_type,
                 cfg.group_id,
-                cfg.user_id,
-                cfg.stream_id,
             )
             return
         try:
@@ -625,7 +502,7 @@ class HoldOnPlugin(MaiBotPlugin):
             if not sent:
                 self.ctx.logger.warning("hold_on 通知发送失败 target=%s", target)
             else:
-                self.ctx.logger.info("hold_on 已转发通知 target=%s events=%s", target, [e.kind for e in events])
+                self.ctx.logger.info("hold_on 已转发停模通知 target=%s", target)
         except Exception as exc:
             self.ctx.logger.error("hold_on 通知发送异常: %s", exc, exc_info=True)
 
@@ -667,16 +544,14 @@ class HoldOnPlugin(MaiBotPlugin):
 
     @staticmethod
     def _looks_like_command(text: str) -> bool:
-        """命令类消息放行，供本插件及其他插件的 @Command 处理。"""
-
         return str(text or "").strip().startswith("/")
 
     # ─── Hooks ───────────────────────────────────────────────────
 
     @HookHandler(
         "maisaka.replyer.before_model_request",
-        name="hold_on_replyer_count",
-        description="对选中模型做限流计数（不改写请求）",
+        name="hold_on_replyer_track",
+        description="记录本轮选用模型，供成功统计归因",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
     )
@@ -688,27 +563,17 @@ class HoldOnPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        if not self._active() or self._should_global_stop():
+        if not self._active():
             return {"action": "continue"}
-
         model = str(selected_model_name or requested_model_name or "").strip()
         if session_id and model:
             self._last_selected_model[str(session_id)] = model
-        if model:
-            events = self.policy.note_request(model_name=model)
-            if events:
-                self.ctx.logger.warning(
-                    "hold_on 限流触发：model=%s events=%s",
-                    model,
-                    [(e.kind, e.reason) for e in events],
-                )
-                await self._notify_events(events)
         return {"action": "continue"}
 
     @HookHandler(
         "maisaka.replyer.after_response",
         name="hold_on_replyer_success",
-        description="成功时重置错误连击（不改写响应）",
+        description="成功响应计入模型统计",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
     )
@@ -733,28 +598,33 @@ class HoldOnPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.after_process",
         name="hold_on_receive_abort",
-        description="全局停模时 abort 入站（晚序：先让其他插件有机会截获）",
+        description="错误阈值停模时 LATE abort 入站",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
     )
     async def handle_receive_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
         del kwargs
-        if not self._active() or not self._should_global_stop():
+        if not self._active() or not self.policy.is_holding():
             return {"action": "continue"}
 
         text = self._message_plain(message)
-        # 放行命令：本插件 /稍等 /解除，以及其他插件的 /xxx
         if self._looks_like_command(text):
             return {"action": "continue"}
 
-        self.ctx.logger.info("hold_on 全局停模：abort 入站 text=%.40r", text)
+        hold = self.state.hold_info()
+        self.ctx.logger.info(
+            "hold_on 停模 abort：剩余=%ss reason=%.80s text=%.40r",
+            int(hold.remaining_seconds()),
+            hold.reason,
+            text,
+        )
         return {"action": "abort"}
 
     # ─── 命令 ────────────────────────────────────────────────────
 
     @Command(
         "holdon_status",
-        description="稍等状态",
+        description="稍等状态与出错率",
         pattern=r"/稍等\s*$",
     )
     async def cmd_status(self, **kwargs: Any):
@@ -772,8 +642,11 @@ class HoldOnPlugin(MaiBotPlugin):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
             return await self._deny(stream_id)
-        n = self.state.clear_all()
-        return await self._send(stream_id, f"已全局解除稍等（清理 {n} 项）。")
+        cleared_hold = self.state.clear_hold()
+        # 仅清停模；统计保留。若要连统计清掉可用 clear_all，这里给用户明确反馈
+        if cleared_hold:
+            return await self._send(stream_id, "已解除。")
+        return await self._send(stream_id, "当前未停止响应。")
 
 
 def create_plugin() -> HoldOnPlugin:

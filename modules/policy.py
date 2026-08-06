@@ -1,20 +1,12 @@
-"""限流 / 禁用 / 功能全灭策略。"""
+"""错误阈值规则 → 停模。"""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from .error_classify import classify_error, error_type_matches
 from .state import HoldOnState
-
-
-@dataclass(frozen=True)
-class NamedLimit:
-    name: str
-    max_requests_per_minute: int = 0
-    disable_seconds: int = 90
-    provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -24,296 +16,237 @@ class FeatureModels:
 
 
 @dataclass(frozen=True)
-class PolicyEvent:
-    """策略新触发事件（用于通知转发，避免重复刷屏）。"""
+class ThresholdRule:
+    """某一 scope + 错误类型在窗口内达阈值则停模。"""
 
-    kind: str  # rpm_global / rpm_provider / rpm_model / error_model / global_stop
+    scope: str  # model / provider / feature
+    name: str = ""  # 空 = 该 scope 下任意目标各自计数
+    error_type: str = "*"
+    window_seconds: int = 60
+    threshold: int = 5
+    hold_seconds: int = 90
+
+
+@dataclass(frozen=True)
+class HoldEvent:
+    """新触发停模（用于通知）。"""
+
     reason: str
     scope: str = ""
-    key: str = ""
+    name: str = ""
+    error_type: str = ""
+    count: int = 0
+    threshold: int = 0
+    window_seconds: int = 0
 
 
 class HoldOnPolicy:
-    """根据配置与状态判定是否拦截、禁用多久。"""
-
     def __init__(
         self,
         state: HoldOnState,
         *,
-        global_max_rpm: int,
-        global_disable_seconds: int,
-        provider_limits: Sequence[NamedLimit],
-        model_limits: Sequence[NamedLimit],
+        rules: Sequence[ThresholdRule],
         features: Sequence[FeatureModels],
-        error_base_seconds: int,
-        error_max_seconds: int,
-        error_exponential: bool,
-        error_multiplier: float,
-        feature_kill_enabled: bool,
+        model_providers: Dict[str, str],
+        stats_window_seconds: int = 600,
     ) -> None:
         self.state = state
-        self.global_max_rpm = max(0, int(global_max_rpm or 0))
-        self.global_disable_seconds = max(0, int(global_disable_seconds or 0))
-        self.provider_limits = {p.name: p for p in provider_limits if p.name}
-        self.model_limits = {m.name: m for m in model_limits if m.name}
-        self.model_provider = {
-            m.name: m.provider for m in model_limits if m.name and m.provider
-        }
+        self.rules = [r for r in rules if int(r.threshold or 0) > 0]
         self.features = {f.feature: tuple(f.models) for f in features if f.feature}
-        self.error_base_seconds = max(1, int(error_base_seconds or 60))
-        self.error_max_seconds = max(self.error_base_seconds, int(error_max_seconds or 3600))
-        self.error_exponential = bool(error_exponential)
-        self.error_multiplier = max(1.0, float(error_multiplier or 2.0))
-        self.feature_kill_enabled = bool(feature_kill_enabled)
+        self.model_providers = {str(k): str(v) for k, v in (model_providers or {}).items() if k}
+        self.stats_window_seconds = max(60, int(stats_window_seconds or 600))
+        for model, provider in self.model_providers.items():
+            self.state.register_model_provider(model, provider)
 
     def provider_of(self, model_name: str) -> str:
         name = str(model_name or "").strip()
         if not name:
             return ""
-        if name in self.model_provider:
-            return self.model_provider[name]
-        limit = self.model_limits.get(name)
-        return str(limit.provider or "").strip() if limit else ""
+        return self.model_providers.get(name) or self.state.provider_of(name)
 
-    def register_model_provider(self, model_name: str, provider: str) -> None:
-        model = str(model_name or "").strip()
-        prov = str(provider or "").strip()
-        if model and prov and model not in self.model_provider:
-            self.model_provider[model] = prov
-
-    def is_model_blocked(self, model_name: str) -> bool:
+    def features_of(self, model_name: str) -> List[str]:
         name = str(model_name or "").strip()
         if not name:
-            return False
-        if self.state.global_stop:
-            return True
-        if self.state.is_disabled("model", name):
-            return True
-        provider = self.provider_of(name)
-        if provider and self.state.is_disabled("provider", provider):
-            return True
-        if self.state.is_disabled("global", "all"):
-            return True
-        return False
-
-    def note_request(self, *, model_name: str = "", provider: str = "") -> List[PolicyEvent]:
-        """记录一次请求；若**新**触达限流则返回事件列表。"""
-
-        if self.state.global_stop or self.state.is_disabled("global", "all"):
             return []
+        return [feat for feat, models in self.features.items() if name in models]
 
+    def on_success(self, model_name: str, provider: str = "") -> None:
         model = str(model_name or "").strip()
+        if not model:
+            return
         prov = str(provider or "").strip() or self.provider_of(model)
+        self.state.record_success(model=model, provider=prov)
 
-        if model and self.state.is_disabled("model", model):
-            return []
-        if prov and self.state.is_disabled("provider", prov):
-            return []
-
-        events: List[PolicyEvent] = []
-
-        global_count = self.state.record_hit("global")
-        if self.global_max_rpm > 0 and global_count > self.global_max_rpm:
-            reason = f"全局 RPM 超限（{global_count}/{self.global_max_rpm}）"
-            events.append(
-                PolicyEvent(kind="rpm_global", reason=reason, scope="global", key="all")
-            )
-            if self._activate_global_stop(reason, source="ratelimit"):
-                events.append(
-                    PolicyEvent(kind="global_stop", reason=reason, scope="global", key="all")
-                )
-            return events
-
-        if prov:
-            plimit = self.provider_limits.get(prov)
-            if plimit and plimit.max_requests_per_minute > 0:
-                count = self.state.record_hit(f"provider:{prov}")
-                if count > plimit.max_requests_per_minute:
-                    seconds = plimit.disable_seconds or self.global_disable_seconds or 90
-                    reason = f"厂商 RPM 超限（{count}/{plimit.max_requests_per_minute}）"
-                    self.state.set_disable(
-                        scope="provider",
-                        key=prov,
-                        seconds=seconds,
-                        reason=reason,
-                        source="ratelimit",
-                    )
-                    events.append(
-                        PolicyEvent(kind="rpm_provider", reason=reason, scope="provider", key=prov)
-                    )
-                    kill = self._maybe_feature_kill()
-                    if kill is not None:
-                        events.append(kill)
-                    return events
-
-        if model:
-            mlimit = self.model_limits.get(model)
-            if mlimit and mlimit.max_requests_per_minute > 0:
-                count = self.state.record_hit(f"model:{model}")
-                if count > mlimit.max_requests_per_minute:
-                    seconds = mlimit.disable_seconds or self.global_disable_seconds or 90
-                    reason = f"模型 RPM 超限（{count}/{mlimit.max_requests_per_minute}）"
-                    self.state.set_disable(
-                        scope="model",
-                        key=model,
-                        seconds=seconds,
-                        reason=reason,
-                        source="ratelimit",
-                        error_streak=0,
-                    )
-                    events.append(
-                        PolicyEvent(kind="rpm_model", reason=reason, scope="model", key=model)
-                    )
-                    kill = self._maybe_feature_kill()
-                    if kill is not None:
-                        events.append(kill)
-                    return events
-            else:
-                self.state.record_hit(f"model:{model}")
-
-        return []
-
-    def compute_error_disable_seconds(self, streak: int, retry_after: Optional[float] = None) -> float:
-        streak = max(1, int(streak or 1))
-        if self.error_exponential:
-            seconds = self.error_base_seconds * math.pow(self.error_multiplier, streak - 1)
-        else:
-            seconds = float(self.error_base_seconds)
-        seconds = min(float(self.error_max_seconds), float(seconds))
-        if retry_after is not None:
-            try:
-                seconds = max(seconds, float(retry_after))
-            except (TypeError, ValueError):
-                pass
-        return seconds
-
-    def disable_for_error(
+    def on_error(
         self,
         *,
         model_name: str,
         provider: str = "",
         message: str = "",
-        retry_after: Optional[float] = None,
-    ) -> List[PolicyEvent]:
-        """任意模型错误均禁用；返回新触发的通知事件（错误禁用 / 全局停模）。"""
-
+        error_type: str = "",
+        error: Optional[dict] = None,
+        payload: Optional[dict] = None,
+    ) -> Optional[HoldEvent]:
         model = str(model_name or "").strip()
         if not model:
-            return []
-        prov = str(provider or "").strip() or self.provider_of(model)
-        self.register_model_provider(model, prov)
-        was_disabled = self.state.is_disabled("model", model)
-        streak = self.state.bump_error_streak("model", model)
-        seconds = self.compute_error_disable_seconds(streak, retry_after)
-        detail = self._short(message) if message else "模型请求失败"
-        reason = f"模型错误（第 {streak} 次）: {detail}"
-        self.state.set_disable(
-            scope="model",
-            key=model,
-            seconds=seconds,
-            reason=reason,
-            source="error",
-            error_streak=streak,
-        )
-        events: List[PolicyEvent] = []
-        # 仅在「新进入禁用」时通知，避免连击延长时刷屏
-        if not was_disabled:
-            events.append(
-                PolicyEvent(kind="error_model", reason=reason, scope="model", key=model)
-            )
-        kill = self._maybe_feature_kill()
-        if kill is not None:
-            events.append(kill)
-        return events
-
-    def on_success(self, model_name: str) -> None:
-        model = str(model_name or "").strip()
-        if model:
-            self.state.reset_error_streak("model", model)
-
-    def _activate_global_stop(self, reason: str, *, source: str) -> bool:
-        """置全局停模；若为新触发返回 True。"""
-
-        already = bool(self.state.global_stop or self.state.is_disabled("global", "all"))
-        self.state.set_global_stop(True, reason)
-        self.state.set_disable(
-            scope="global",
-            key="all",
-            seconds=self.global_disable_seconds or 90,
-            reason=reason,
-            source=source,
-        )
-        return not already
-
-    def _maybe_feature_kill(self) -> Optional[PolicyEvent]:
-        if not self.feature_kill_enabled or not self.features:
             return None
-        for feature, models in self.features.items():
-            names = [m for m in models if str(m).strip()]
-            if not names:
+        prov = str(provider or "").strip() or self.provider_of(model)
+        etype = str(error_type or "").strip() or classify_error(
+            message, error=error, payload=payload
+        )
+        self.state.record_error(
+            model=model,
+            provider=prov,
+            error_type=etype,
+            message=message,
+        )
+        return self._evaluate_rules(model=model, provider=prov, error_type=etype)
+
+    def _evaluate_rules(
+        self, *, model: str, provider: str, error_type: str
+    ) -> Optional[HoldEvent]:
+        triggered: Optional[HoldEvent] = None
+        for rule in self.rules:
+            hit = self._rule_hit_count(rule, model=model, provider=provider, error_type=error_type)
+            if hit is None:
                 continue
-            if all(self.state.is_disabled("model", m) for m in names):
-                reason = f"功能 {feature} 的全部模型均已禁用: {', '.join(names)}"
-                if self._activate_global_stop(reason, source="feature_kill"):
-                    return PolicyEvent(
-                        kind="global_stop",
-                        reason=reason,
-                        scope="global",
-                        key="all",
-                    )
+            target_name, count = hit
+            if count < int(rule.threshold):
+                continue
+            reason = (
+                f"{rule.scope}:{target_name or '*'} 类型 {rule.error_type or '*'} "
+                f"在 {rule.window_seconds}s 内达到 {count}/{rule.threshold}"
+            )
+            newly = self.state.activate_hold(
+                seconds=float(rule.hold_seconds or 90),
+                reason=reason,
+                rule_scope=rule.scope,
+                rule_name=target_name,
+                error_type=rule.error_type or error_type,
+            )
+            event = HoldEvent(
+                reason=reason,
+                scope=rule.scope,
+                name=target_name,
+                error_type=rule.error_type or error_type,
+                count=count,
+                threshold=int(rule.threshold),
+                window_seconds=int(rule.window_seconds),
+            )
+            if newly and triggered is None:
+                triggered = event
+            elif newly:
+                # 多规则同时命中时保留第一条新触发；后续仅延长
+                pass
+        return triggered
+
+    def _rule_hit_count(
+        self,
+        rule: ThresholdRule,
+        *,
+        model: str,
+        provider: str,
+        error_type: str,
+    ) -> Optional[Tuple[str, int]]:
+        """若本条错误与规则相关，返回 (目标名, 窗口计数)；无关返回 None。"""
+
+        if not error_type_matches(rule.error_type, error_type):
+            return None
+
+        scope = str(rule.scope or "model").strip().lower()
+        want_name = str(rule.name or "").strip()
+        window = max(1, int(rule.window_seconds or 60))
+
+        if scope == "model":
+            if want_name and want_name != model:
                 return None
+            target = want_name or model
+            count = self.state.count_errors(
+                window_seconds=window,
+                error_type=rule.error_type,
+                model=target,
+            )
+            return target, count
+
+        if scope == "provider":
+            if not provider:
+                return None
+            if want_name and want_name != provider:
+                return None
+            target = want_name or provider
+            count = self.state.count_errors(
+                window_seconds=window,
+                error_type=rule.error_type,
+                provider=target,
+            )
+            return target, count
+
+        if scope == "feature":
+            feats = self.features_of(model)
+            if not feats:
+                return None
+            if want_name:
+                if want_name not in feats:
+                    return None
+                feat_names = [want_name]
+            else:
+                feat_names = feats
+            best: Optional[Tuple[str, int]] = None
+            for feat in feat_names:
+                models = list(self.features.get(feat) or ())
+                if not models:
+                    continue
+                count = self.state.count_errors(
+                    window_seconds=window,
+                    error_type=rule.error_type,
+                    models=models,
+                )
+                if best is None or count > best[1]:
+                    best = (feat, count)
+            return best
+
         return None
 
-    def refresh_feature_kill(self) -> None:
-        if not self.state.global_stop:
-            return
-        source_entry = self.state.get_disable("global", "all")
-        if source_entry and source_entry.source not in ("feature_kill", "ratelimit", ""):
-            return
-        if self.feature_kill_enabled and self.features:
-            for _feature, models in self.features.items():
-                names = [m for m in models if str(m).strip()]
-                if names and all(self.state.is_disabled("model", m) for m in names):
-                    return
-        if self.state.is_disabled("global", "all"):
-            return
-        if source_entry is None or not source_entry.is_active():
-            self.state.set_global_stop(False)
-
-    def any_configured_models_available(self) -> bool:
-        """若配置了 feature 模型，是否仍有任一可用。"""
-
-        names: List[str] = []
-        for models in self.features.values():
-            names.extend(m for m in models if m)
-        if not names:
-            return True
-        return any(not self.is_model_blocked(m) for m in names)
-
-    @staticmethod
-    def _short(text: str, limit: int = 160) -> str:
-        normalized = " ".join(str(text or "").split())
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[:limit] + "…"
+    def is_holding(self) -> bool:
+        return self.state.is_holding()
 
     def status_text(self) -> str:
-        self.refresh_feature_kill()
-        snap = self.state.snapshot()
+        snap = self.state.snapshot(stats_window=float(self.stats_window_seconds))
         lines = ["【稍等状态】"]
-        if snap["global_stop"]:
-            lines.append(f"全局停模: 是（{snap['global_stop_reason'] or '无原因'}）")
-        else:
-            lines.append("全局停模: 否")
-        disables = snap.get("disables") or []
-        if not disables:
-            lines.append("当前无禁用项。")
-            return "\n".join(lines)
-        lines.append(f"禁用项（{len(disables)}）:")
-        for item in disables:
-            rem = item.get("remaining_seconds", 0)
+        if snap["holding"]:
+            hold = snap["hold"]
             lines.append(
-                f"- [{item.get('scope')}] {item.get('key')} "
-                f"剩余 {rem}s | source={item.get('source')} | {item.get('reason')}"
+                f"停模中: 是（剩余 {int(hold['remaining'])}s）"
             )
+            if hold.get("reason"):
+                lines.append(f"原因: {hold['reason']}")
+        else:
+            lines.append("停模中: 否")
+
+        lines.append(f"统计窗口: {int(snap['stats_window'])}s")
+        models = snap.get("models") or []
+        if not models:
+            lines.append("暂无模型调用统计。")
+            return "\n".join(lines)
+
+        lines.append("模型出错率:")
+        for item in models:
+            ok = int(item.get("success") or 0)
+            err = int(item.get("error") or 0)
+            rate = float(item.get("error_rate") or 0.0)
+            provider = str(item.get("provider") or "")
+            label = str(item.get("model") or "")
+            if provider:
+                label = f"{label} ({provider})"
+            lines.append(f"- {label}: 成功 {ok} / 失败 {err}  出错率 {rate:.1f}%")
+            by_type = item.get("by_type") or {}
+            if by_type:
+                parts = [f"{k}×{v}" for k, v in sorted(by_type.items(), key=lambda x: (-x[1], x[0]))]
+                lines.append(f"  类型: {', '.join(parts)}")
+            reasons = item.get("recent_reasons") or []
+            for reason in reasons[:3]:
+                short = " ".join(str(reason).split())
+                if len(short) > 120:
+                    short = short[:120] + "…"
+                lines.append(f"  · {short}")
         return "\n".join(lines)

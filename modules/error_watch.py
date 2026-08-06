@@ -169,11 +169,17 @@ class ErrorSnapshotWatcher:
         if not model_name:
             return None
 
+        from .error_classify import classify_error
+
         retry_after = self._find_retry_after(payload, error)
+        error_type = classify_error(message, error=error, payload=payload)
         return {
             "model_name": model_name,
             "provider": provider,
             "message": message,
+            "error_type": error_type,
+            "error": error,
+            "payload": payload,
             "retry_after": retry_after,
             "source_path": str(path),
         }
