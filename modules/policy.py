@@ -17,10 +17,8 @@ class FeatureModels:
 
 @dataclass(frozen=True)
 class ThresholdRule:
-    """某一 scope + 错误类型在窗口内达阈值则停模。"""
-
     scope: str  # model / provider / feature
-    name: str = ""  # 空 = 该 scope 下任意目标各自计数
+    name: str = ""
     error_type: str = "*"
     window_seconds: int = 60
     threshold: int = 5
@@ -29,8 +27,6 @@ class ThresholdRule:
 
 @dataclass(frozen=True)
 class HoldEvent:
-    """新触发停模（用于通知）。"""
-
     reason: str
     scope: str = ""
     name: str = ""
@@ -70,13 +66,6 @@ class HoldOnPolicy:
             return []
         return [feat for feat, models in self.features.items() if name in models]
 
-    def on_success(self, model_name: str, provider: str = "") -> None:
-        model = str(model_name or "").strip()
-        if not model:
-            return
-        prov = str(provider or "").strip() or self.provider_of(model)
-        self.state.record_success(model=model, provider=prov)
-
     def on_error(
         self,
         *,
@@ -85,15 +74,12 @@ class HoldOnPolicy:
         message: str = "",
         error_type: str = "",
         error: Optional[dict] = None,
-        payload: Optional[dict] = None,
     ) -> Optional[HoldEvent]:
         model = str(model_name or "").strip()
         if not model:
             return None
         prov = str(provider or "").strip() or self.provider_of(model)
-        etype = str(error_type or "").strip() or classify_error(
-            message, error=error, payload=payload
-        )
+        etype = str(error_type or "").strip() or classify_error(message, error=error)
         self.state.record_error(
             model=model,
             provider=prov,
@@ -124,20 +110,16 @@ class HoldOnPolicy:
                 rule_name=target_name,
                 error_type=rule.error_type or error_type,
             )
-            event = HoldEvent(
-                reason=reason,
-                scope=rule.scope,
-                name=target_name,
-                error_type=rule.error_type or error_type,
-                count=count,
-                threshold=int(rule.threshold),
-                window_seconds=int(rule.window_seconds),
-            )
             if newly and triggered is None:
-                triggered = event
-            elif newly:
-                # 多规则同时命中时保留第一条新触发；后续仅延长
-                pass
+                triggered = HoldEvent(
+                    reason=reason,
+                    scope=rule.scope,
+                    name=target_name,
+                    error_type=rule.error_type or error_type,
+                    count=count,
+                    threshold=int(rule.threshold),
+                    window_seconds=int(rule.window_seconds),
+                )
         return triggered
 
     def _rule_hit_count(
@@ -148,8 +130,6 @@ class HoldOnPolicy:
         provider: str,
         error_type: str,
     ) -> Optional[Tuple[str, int]]:
-        """若本条错误与规则相关，返回 (目标名, 窗口计数)；无关返回 None。"""
-
         if not error_type_matches(rule.error_type, error_type):
             return None
 
@@ -210,14 +190,15 @@ class HoldOnPolicy:
     def is_holding(self) -> bool:
         return self.state.is_holding()
 
-    def status_text(self) -> str:
-        snap = self.state.snapshot(stats_window=float(self.stats_window_seconds))
+    def status_text(self, host_success: Dict[str, Dict]) -> str:
+        snap = self.state.snapshot(
+            stats_window=float(self.stats_window_seconds),
+            host_success=host_success,
+        )
         lines = ["【稍等状态】"]
         if snap["holding"]:
             hold = snap["hold"]
-            lines.append(
-                f"停模中: 是（剩余 {int(hold['remaining'])}s）"
-            )
+            lines.append(f"停模中: 是（剩余 {int(hold['remaining'])}s）")
             if hold.get("reason"):
                 lines.append(f"原因: {hold['reason']}")
         else:
@@ -243,8 +224,7 @@ class HoldOnPolicy:
             if by_type:
                 parts = [f"{k}×{v}" for k, v in sorted(by_type.items(), key=lambda x: (-x[1], x[0]))]
                 lines.append(f"  类型: {', '.join(parts)}")
-            reasons = item.get("recent_reasons") or []
-            for reason in reasons[:3]:
+            for reason in (item.get("recent_reasons") or [])[:3]:
                 short = " ".join(str(reason).split())
                 if len(short) > 120:
                     short = short[:120] + "…"

@@ -1,5 +1,15 @@
 # 更新日志
 
+## 2.0.2
+
+- 清理遗留兜底：去掉本地 success 计数、旧快照顶层 error、`llm_request` 监听、v1 配置合并等。
+- 成功只读 `llm_usage`；失败只解析 `llm_error` schema v3 的 `attempts[].error`。
+
+## 2.0.1
+
+- 成功次数改为读取宿主 `llm_usage`（`ModelUsage`），与 `maibot_statistic` 的「调用次数 / REQ_CNT_BY_MODEL」同源；不再用 replyer hook 估成功。
+- manifest 增加 `database.query`。
+
 ## 2.0.0
 
 - **功能重定义**：去掉请求 RPM / 单模型禁用 / 功能全灭逻辑。

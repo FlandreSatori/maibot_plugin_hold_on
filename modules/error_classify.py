@@ -6,7 +6,6 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-
 _STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
 
 
@@ -14,23 +13,17 @@ def classify_error(
     message: str = "",
     *,
     error: Optional[Dict[str, Any]] = None,
-    payload: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """归类为稳定短标签：429 / 403 / 401 / 5xx / timeout / connection / other 等。"""
+    """归类：优先 attempt.error.status_code，否则从消息推断。"""
 
     error = error if isinstance(error, dict) else {}
-    payload = payload if isinstance(payload, dict) else {}
-
     candidates: list[str] = []
-    for key in ("status", "status_code", "http_status", "code"):
-        value = error.get(key)
-        if value is not None:
-            candidates.append(str(value))
-        value = payload.get(key)
-        if value is not None:
-            candidates.append(str(value))
 
-    err_type = str(error.get("type") or payload.get("error_type") or "").strip()
+    status = error.get("status_code")
+    if status is not None:
+        candidates.append(str(status))
+
+    err_type = str(error.get("type") or "").strip()
     if err_type:
         candidates.append(err_type)
 
@@ -70,8 +63,6 @@ def classify_error(
 
 
 def error_type_matches(rule_type: str, actual: str) -> bool:
-    """规则 error_type 是否匹配实际类型。``*`` / ``any`` / 空 = 任意。"""
-
     want = str(rule_type or "").strip().lower()
     got = str(actual or "").strip().lower()
     if not want or want in ("*", "any", "all"):

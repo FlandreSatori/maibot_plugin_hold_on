@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
@@ -20,6 +20,7 @@ from .modules.model_discover import (
 )
 from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
 from .modules.state import HoldOnState
+from .modules.usage_sync import fetch_req_cnt_by_model
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 
@@ -33,7 +34,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.0.0", description="配置版本")
+    config_version: str = Field(default="2.0.2", description="配置版本")
     auto_detect_models: bool = Field(
         default=True,
         description="加载时从宿主 model_config.toml 同步",
@@ -52,6 +53,10 @@ class StatsConfig(PluginConfigBase):
     window_seconds: int = Field(
         default=600,
         description="/稍等 展示的统计窗口秒数",
+    )
+    usage_fetch_limit: int = Field(
+        default=10000,
+        description="从宿主 llm_usage 拉取成功记录的最大条数（按 id 倒序）",
     )
 
 
@@ -130,7 +135,7 @@ class ErrorWatchConfig(PluginConfigBase):
     interval_seconds: float = Field(default=2.0, description="扫描间隔秒")
     roots: list[str] = Field(
         default_factory=list,
-        description="额外监听目录；默认同 cwd 下 logs/llm_request 与 logs/maisaka_prompt/llm_error",
+        description="额外监听目录；默认 logs/maisaka_prompt/llm_error",
     )
 
 
@@ -183,7 +188,6 @@ class HoldOnPlugin(MaiBotPlugin):
         await self._maybe_auto_fill_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
-        self._last_selected_model: Dict[str, str] = {}
 
         if bool(self.config.error_watch.enabled) and bool(self.config.plugin.enabled):
             roots = resolve_watch_roots(self.config.error_watch.roots)
@@ -259,12 +263,13 @@ class HoldOnPlugin(MaiBotPlugin):
         return {
             "plugin": {
                 "enabled": bool(self.config.plugin.enabled),
-                "config_version": "2.0.0",
+                "config_version": "2.0.2",
                 "auto_detect_models": bool(self.config.plugin.auto_detect_models),
                 "model_config_path": str(self.config.plugin.model_config_path or ""),
             },
             "stats": {
                 "window_seconds": int(self.config.stats.window_seconds or 600),
+                "usage_fetch_limit": int(self.config.stats.usage_fetch_limit or 10000),
             },
             "catalog": {
                 "models": [
@@ -313,25 +318,7 @@ class HoldOnPlugin(MaiBotPlugin):
 
     def _persist_config(self) -> None:
         config_path = PLUGIN_DIR / "config.toml"
-        existing: Dict[str, Any] = {}
-        if config_path.exists():
-            try:
-                import tomllib
-
-                existing = tomllib.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
-
-        payload = self._config_payload()
-        # 丢弃 v1 遗留段
-        for obsolete in ("global_limit", "limits", "error_disable", "feature_kill"):
-            existing.pop(obsolete, None)
-        for key, value in existing.items():
-            if key not in payload:
-                payload[key] = value
-        write_simple_toml(config_path, payload)
+        write_simple_toml(config_path, self._config_payload())
 
     def _build_policy(self) -> HoldOnPolicy:
         rules = [
@@ -370,6 +357,16 @@ class HoldOnPlugin(MaiBotPlugin):
     def _active(self) -> bool:
         return bool(self.config.plugin.enabled)
 
+    async def _host_success_counts(self) -> Dict[str, Dict[str, Any]]:
+        """宿主 llm_usage → REQ_CNT_BY_MODEL（与 maibot_statistic 同源）。"""
+
+        return await fetch_req_cnt_by_model(
+            self.ctx.database,
+            window_seconds=float(self.config.stats.window_seconds or 600),
+            limit=int(self.config.stats.usage_fetch_limit or 10000),
+            logger=self.ctx.logger,
+        )
+
     async def _on_snapshot_error(
         self,
         *,
@@ -378,7 +375,6 @@ class HoldOnPlugin(MaiBotPlugin):
         message: str = "",
         error_type: str = "",
         error: Optional[dict] = None,
-        payload: Optional[dict] = None,
         source_path: str = "",
         **_: Any,
     ) -> None:
@@ -390,7 +386,6 @@ class HoldOnPlugin(MaiBotPlugin):
             message=message,
             error_type=error_type,
             error=error,
-            payload=payload,
         )
         self.ctx.logger.warning(
             "hold_on 记录错误：model=%s provider=%s type=%s path=%s hold=%s",
@@ -549,53 +544,6 @@ class HoldOnPlugin(MaiBotPlugin):
     # ─── Hooks ───────────────────────────────────────────────────
 
     @HookHandler(
-        "maisaka.replyer.before_model_request",
-        name="hold_on_replyer_track",
-        description="记录本轮选用模型，供成功统计归因",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.EARLY,
-    )
-    async def handle_replyer_before_model(
-        self,
-        session_id: str = "",
-        selected_model_name: str = "",
-        requested_model_name: str = "",
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        del kwargs
-        if not self._active():
-            return {"action": "continue"}
-        model = str(selected_model_name or requested_model_name or "").strip()
-        if session_id and model:
-            self._last_selected_model[str(session_id)] = model
-        return {"action": "continue"}
-
-    @HookHandler(
-        "maisaka.replyer.after_response",
-        name="hold_on_replyer_success",
-        description="成功响应计入模型统计",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.NORMAL,
-    )
-    async def handle_replyer_after_response(
-        self,
-        session_id: str = "",
-        requested_model_name: str = "",
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        del kwargs
-        if not self._active():
-            return {"action": "continue"}
-        model = str(
-            requested_model_name
-            or self._last_selected_model.get(str(session_id), "")
-            or ""
-        ).strip()
-        if model:
-            self.policy.on_success(model)
-        return {"action": "continue"}
-
-    @HookHandler(
         "chat.receive.after_process",
         name="hold_on_receive_abort",
         description="错误阈值停模时 LATE abort 入站",
@@ -631,7 +579,8 @@ class HoldOnPlugin(MaiBotPlugin):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
             return await self._deny(stream_id)
-        return await self._send(stream_id, self.policy.status_text())
+        host_success = await self._host_success_counts()
+        return await self._send(stream_id, self.policy.status_text(host_success=host_success))
 
     @Command(
         "holdon_clear",
@@ -643,7 +592,6 @@ class HoldOnPlugin(MaiBotPlugin):
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
             return await self._deny(stream_id)
         cleared_hold = self.state.clear_hold()
-        # 仅清停模；统计保留。若要连统计清掉可用 clear_all，这里给用户明确反馈
         if cleared_hold:
             return await self._send(stream_id, "已解除。")
         return await self._send(stream_id, "当前未停止响应。")

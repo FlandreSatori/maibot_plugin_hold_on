@@ -137,23 +137,6 @@ def discovery_to_config_sections(result: DiscoveryResult) -> Dict[str, Any]:
     }
 
 
-def merge_discovery_into_config_dict(
-    existing: Dict[str, Any],
-    sections: Dict[str, Any],
-) -> Dict[str, Any]:
-    """用发现结果覆盖 catalog（保留其余段）。"""
-
-    out = dict(existing or {})
-    catalog = out.setdefault("catalog", {})
-    if not isinstance(catalog, dict):
-        catalog = {}
-        out["catalog"] = catalog
-    discovered = sections.get("catalog") or {}
-    catalog["models"] = list(discovered.get("models") or [])
-    catalog["features"] = list(discovered.get("features") or [])
-    return out
-
-
 def write_simple_toml(path: Path, data: Dict[str, Any]) -> None:
     """写入本插件够用的 TOML（不依赖 tomlkit）。"""
 

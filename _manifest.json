@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "2.0.0",
+  "version": "2.0.2",
   "name": "稍，稍等一下！",
-  "description": "当模型出错次数过高时停止全局LLM的响应，变相提供RPM",
+  "description": "统计模型出错率；按模型/厂商/功能错误阈值 LATE abort",
   "author": {
     "name": "FlandreSatori",
     "url": "https://github.com/FlandreSatori"
@@ -26,6 +26,7 @@
   "capabilities": [
     "send.text",
     "config.get",
+    "database.query",
     "chat.get_stream_by_group_id",
     "chat.get_stream_by_user_id",
     "chat.open_session"

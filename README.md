@@ -14,7 +14,7 @@
 
 ## 行为
 
-1. **统计**：监听失败快照记错误；`replyer` 成功响应记成功。`/稍等` 按窗口展示出错率、错误类型与近期原因。
+1. **统计**：失败快照记错误；成功次数读宿主 `llm_usage`（与日志 `maibot_statistic` 的「调用次数」同源）。`/稍等` 按窗口展示出错率、错误类型与近期原因。
 2. **停模**：匹配 `[[rules.items]]` 后写入停模到期时间；`chat.receive.after_process`（LATE）对非 `/` 命令入站 `abort`。
 3. **解除**：`/解除` 只清停模，保留统计。
 
@@ -26,6 +26,7 @@
 |---|---|
 | `[plugin].auto_detect_models` | 加载时同步 catalog |
 | `[stats].window_seconds` | `/稍等` 统计窗口（默认 600） |
+| `[stats].usage_fetch_limit` | 拉取 `llm_usage` 最大条数（默认 10000） |
 | `[[catalog.models]]` | 模型 ↔ 厂商 |
 | `[[catalog.features]]` | 功能 → 模型列表（`scope=feature` 用） |
 | `[[rules.items]]` | 阈值规则 |
@@ -49,11 +50,12 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "2.0.0"
+config_version = "2.0.2"
 auto_detect_models = true
 
 [stats]
 window_seconds = 600
+usage_fetch_limit = 10000
 
 [[rules.items]]
 scope = "model"
