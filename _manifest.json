@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "2.0.3",
+  "version": "3.0.0",
   "name": "稍，稍等一下！",
   "description": "统计模型出错率，当出错过多时停止全局LLM响应；变相为 模型/厂商/功能 提供RPM",
   "author": {
@@ -26,7 +26,7 @@
   "capabilities": [
     "send.text",
     "config.get",
-    "database.query",
+    "statistics.llm_usage.aggregate",
     "chat.get_stream_by_group_id",
     "chat.get_stream_by_user_id",
     "chat.open_session"

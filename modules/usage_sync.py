@@ -1,86 +1,50 @@
-"""从宿主 llm_usage（ModelUsage）读取成功调用次数。"""
-
+﻿"""宿主 llm_usage 聚合能力代理。"""
 from __future__ import annotations
-
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 
-def parse_timestamp(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, datetime):
-        return value.timestamp()
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        normalized = text.replace("Z", "+00:00")
-        if "T" not in normalized and " " in normalized:
-            normalized = normalized.replace(" ", "T", 1)
-        return datetime.fromisoformat(normalized).timestamp()
-    except Exception:
-        return None
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
 
 
-def model_key_from_usage_row(row: Dict[str, Any]) -> str:
-    assign = str(row.get("model_assign_name") or "").strip()
-    if assign:
-        return assign
-    return str(row.get("model_name") or "").strip() or "unknown"
+def row_scope(row: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "provider": str(row.get("provider_name") or ""),
+        "model": str(row.get("model_alias") or row.get("model_identifier") or "unknown"),
+        "feature": str(row.get("task_name") or ""),
+        "function": str(row.get("request_type") or ""),
+    }
 
 
-def aggregate_req_cnt_by_model(
-    rows: List[Dict[str, Any]],
-    *,
-    window_seconds: float,
-    now_ts: Optional[float] = None,
-) -> Dict[str, Dict[str, Any]]:
-    ts_now = time.time() if now_ts is None else float(now_ts)
-    cutoff = ts_now - max(0.0, float(window_seconds))
-    out: Dict[str, Dict[str, Any]] = {}
+def rows_to_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = {"requests": 0, "tokens": 0, "weighted_tokens": 0.0, "cost": 0.0, "input_tokens": 0, "output_tokens": 0}
+    groups: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ts = parse_timestamp(row.get("timestamp"))
-        if ts is None or ts < cutoff:
-            continue
-        key = model_key_from_usage_row(row)
-        provider = str(row.get("model_api_provider_name") or "").strip()
-        bucket = out.setdefault(key, {"success": 0, "provider": provider})
-        bucket["success"] = int(bucket["success"]) + 1
-        if provider and not bucket.get("provider"):
-            bucket["provider"] = provider
-    return out
+        scope = row_scope(row)
+        key = "|".join(scope.values())
+        item = groups.setdefault(key, {**scope, **{k: 0 for k in total}})
+        values = {
+            "requests": int(row.get("successful_requests") or 0),
+            "tokens": int(row.get("total_tokens") or 0),
+            "input_tokens": int(row.get("prompt_tokens") or 0),
+            "output_tokens": int(row.get("completion_tokens") or 0),
+            "cost": float(row.get("cost_cny") or 0.0),
+        }
+        values["weighted_tokens"] = float(values["input_tokens"] + values["output_tokens"])
+        for k, v in values.items():
+            item[k] += v
+            total[k] += v
+    return {"total": total, "groups": list(groups.values()), "rows": rows}
 
 
-async def fetch_req_cnt_by_model(
-    database: Any,
-    *,
-    window_seconds: float,
-    limit: int = 10000,
-    logger: Any = None,
-) -> Dict[str, Dict[str, Any]]:
-    try:
-        result = await database.query(
-            model_name="ModelUsage",
-            query_type="get",
-            order_by=["-id"],
-            limit=max(100, int(limit or 10000)),
-        )
-    except Exception as exc:
-        if logger is not None:
-            logger.warning("hold_on 读取 ModelUsage 失败: %s", exc)
-        return {}
-
-    if not isinstance(result, list):
-        if logger is not None:
-            logger.warning("hold_on ModelUsage 返回非列表: %s", type(result).__name__)
-        return {}
-
-    rows = [r for r in result if isinstance(r, dict)]
-    return aggregate_req_cnt_by_model(rows, window_seconds=window_seconds)
+async def aggregate_usage(ctx: Any, start: datetime, end: datetime, limit: int = 5000) -> Dict[str, Any]:
+    result = await ctx.call_capability(
+        "statistics.llm_usage.aggregate",
+        start_time=iso_utc(start),
+        end_time=iso_utc(end),
+        limit=limit,
+    )
+    if not isinstance(result, dict) or not result.get("success"):
+        raise RuntimeError(str((result or {}).get("error") if isinstance(result, dict) else result))
+    return rows_to_metrics(list(result.get("rows") or []))
