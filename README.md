@@ -4,23 +4,42 @@
 
 插件通过 `llm_usage` 统计成功调用、Token 与成本，通过 `llm_error` schema v3 统计失败；达到静态速率或动态预算条件后，在 LATE 阶段停止新的入站消息。
 
-## 配置
+## 配置含义
 
 固定选项在 WebUI 中使用下拉框；模型、厂商和功能名称由宿主配置自动探测。配置字段说明以 WebUI 为准
 
-- `static_limits`：动态预算关闭时，按厂商、模型或功能限制请求数、加权 Token 或成本。
-- `budget`：启用后只使用动态预算。预算按每日时间段均匀消耗。
-- `strict`：按计划曲线超速立即停止。
-- `balanced`：允许有限透支，透支后等待追回。
-- `lenient`：允许更大的自定义透支比例。
-- `error_rules`：指定窗口内错误次数达限后停止入站。第一次停 `hold_seconds`；若解除/到期后仍无成功调用又再次达限，则按 2x、3x… 线性增长，上限 `hold_max_seconds`。
-- Token 指标使用 `input_tokens * input_weight + output_tokens * output_weight`。
+- 插件
+  - auto_detect_models：加载插件时是否自动读取模型列表
+  - model_config_path：留空表示读取默认位置
+
+- 统计
+  - windows_seconds：统计窗口
+  - usage_limit：单词最多读取成功调用数量
+
+- 模型列表
+  - 插件启动时会自动读取已配置的模型(model)和功能(feature)
+
+- 静态限制
+  - 对厂商（provider）/ 模型（model）/ 功能 （feature）提供静态速率限制
+  - 可以限制 请求速度（requests） /  额度（tokens） / 成本 （cost）
+
+- 动态预算
+  - 可以动态地控制使用速度，尽量在指定的时间范围内均匀地用完额度
+  - 预估速度=剩余额度/剩余时间
+  - strict：超出预估速度则马上停止60s，下次统计时重新判断是否超速
+  - balanced：允许超速指定的时间，然后停止60s，下次统计时重新判断是否超速
+
+- 错误阈值
+  - 当某一项功能出错次数到达指定值时，停止LLM响应避免产生无意义的消耗
+  - 同时转发到指定群聊
+  - 停止时间会线性增长
+
+- 权限
+  - 可以使用命令的白名单
+
 
 ## 命令
 
 - `/稍等`：显示当前窗口的成功调用、Token、成本、错误与限制状态。
 - `/解除`：解除当前停止状态，保留统计。
 
-## 数据语义
-
-成功数据通过宿主已有的 `database.query` 读取 `ModelUsage`（表 `llm_usage`），插件按时间窗自行过滤并聚合；失败来自 `logs/maisaka_prompt/llm_error` 的 schema v3 attempt。不依赖宿主新增统计 capability。

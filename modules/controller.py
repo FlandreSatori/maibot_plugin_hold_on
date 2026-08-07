@@ -25,7 +25,7 @@ class BudgetRule:
     input_weight: float = 1.0
     output_weight: float = 1.0
     strategy: str = "strict"
-    overshoot_ratio: float = 0.0
+    overshoot_time: float = 300.0
 
 @dataclass(frozen=True)
 class Decision:
@@ -78,19 +78,20 @@ def budget_progress(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: dat
     duration = max(1.0, (rule.end - rule.start).total_seconds())
     elapsed = max(0.0, min((now - rule.start).total_seconds(), duration))
     remaining_seconds = max(0.0, (rule.end - now).total_seconds())
-    expected = rule.amount * elapsed / duration
+    plan_speed = rule.amount / duration
+    expected = plan_speed * elapsed
     actual = 0.0
     for group in groups:
         if matches(group, rule.scope, rule.target):
             actual += metric_value(group, rule.metric, rule.input_weight, rule.output_weight)
-    if rule.strategy == "strict":
-        allowance = expected
-    elif rule.strategy == "balanced":
-        allowance = expected + (rule.amount - expected) * max(0.0, min(rule.overshoot_ratio, 1.0))
+    if rule.strategy == "balanced":
+        # 允许最多超前 overshoot_time 秒的计划额度
+        ahead = plan_speed * max(0.0, float(rule.overshoot_time or 0.0))
+        allowance = min(rule.amount, expected + ahead)
     else:
-        allowance = expected * (1.0 + max(0.0, rule.overshoot_ratio))
+        # strict：不允许超过当前时刻计划曲线
+        allowance = expected
     remaining = max(0.0, rule.amount - actual)
-    plan_speed = rule.amount / duration
     actual_speed = actual / elapsed if elapsed > 0 else 0.0
     recover_speed = remaining / remaining_seconds if remaining_seconds > 0 else 0.0
     return {

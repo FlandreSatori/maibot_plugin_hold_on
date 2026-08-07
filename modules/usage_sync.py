@@ -55,8 +55,6 @@ def aggregate_usage_rows(
     *,
     start_ts: float,
     end_ts: float,
-    input_weight: float = 1.0,
-    output_weight: float = 1.0,
 ) -> Dict[str, Any]:
     """把 ModelUsage 行聚合成 total + groups（按 provider/model/feature）。"""
 
@@ -82,14 +80,13 @@ def aggregate_usage_rows(
         output_tokens = int(row.get("completion_tokens") or 0)
         tokens = int(row.get("total_tokens") or (input_tokens + output_tokens))
         cost = float(row.get("cost") or 0.0)
-        weighted = input_tokens * float(input_weight) + output_tokens * float(output_weight)
         values = {
             "requests": 1,
             "tokens": tokens,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cost": cost,
-            "weighted_tokens": weighted,
+            "weighted_tokens": float(input_tokens + output_tokens),
         }
         for name, value in values.items():
             item[name] = float(item[name]) + value
@@ -129,9 +126,6 @@ async def aggregate_usage(
     start: datetime,
     end: datetime,
     limit: int = 5000,
-    *,
-    input_weight: float = 1.0,
-    output_weight: float = 1.0,
 ) -> Dict[str, Any]:
     """通过 ctx.db 拉取 ModelUsage，再按 [start, end] 过滤并聚合。"""
 
@@ -147,6 +141,4 @@ async def aggregate_usage(
         rows,
         start_ts=start.timestamp(),
         end_ts=end.timestamp(),
-        input_weight=input_weight,
-        output_weight=output_weight,
     )

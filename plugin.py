@@ -35,8 +35,6 @@ class StatsConfig(PluginConfigBase):
     __ui_order__ = 1
     window_seconds: int = Field(default=3600, ge=60, description="控制统计窗口秒数")
     usage_limit: int = Field(default=5000, ge=100, le=5000, description="单次聚合最多读取的成功记录数")
-    input_weight: float = Field(default=1.0, ge=0, description="输入 token 计权倍数")
-    output_weight: float = Field(default=1.0, ge=0, description="输出 token 计权倍数")
 
 class CatalogModel(PluginConfigBase):
     name: str = Field(default="", description="模型别名")
@@ -45,7 +43,7 @@ class CatalogFeature(PluginConfigBase):
     feature: str = Field(default="", description="功能名，对应 task_name")
     models: list[str] = Field(default_factory=list, description="功能使用的模型别名")
 class CatalogConfig(PluginConfigBase):
-    __ui_label__ = "自动探测目录"
+    __ui_label__ = "模型列表"
     __ui_icon__ = "book"
     __ui_order__ = 2
     models: list[CatalogModel] = Field(default_factory=list, description="自动同步的模型与厂商")
@@ -60,10 +58,10 @@ class StaticLimit(PluginConfigBase):
     input_weight: float = Field(default=1.0, ge=0, description="输入 token 倍率")
     output_weight: float = Field(default=1.0, ge=0, description="输出 token 倍率")
 class StaticLimitsConfig(PluginConfigBase):
-    __ui_label__ = "静态速率限制"
+    __ui_label__ = "静态限制"
     __ui_icon__ = "gauge"
     __ui_order__ = 3
-    enabled: bool = Field(default=True, description="动态预算关闭时启用静态限制")
+    enabled: bool = Field(default=False, description="动态预算关闭时启用静态限制")
     items: list[StaticLimit] = Field(default_factory=list, description="厂商、模型或功能的限制列表")
 
 class BudgetRuleConfig(PluginConfigBase):
@@ -73,15 +71,15 @@ class BudgetRuleConfig(PluginConfigBase):
     amount: float = Field(default=100, gt=0, description="周期总额度")
     start_time: str = Field(default="08:00", description="每日周期开始，HH:MM")
     end_time: str = Field(default="22:00", description="每日周期结束，HH:MM")
-    strategy: Literal["strict", "balanced", "lenient"] = Field(default="strict", description="超速策略")
-    overshoot_ratio: float = Field(default=0.1, ge=0, le=10, description="允许超出计划曲线的比例")
+    strategy: Literal["strict", "balanced"] = Field(default="strict", description="超速策略：strict 不超速；balanced 允许在 overshoot_time 秒内超速")
+    overshoot_time: float = Field(default=300, ge=0, description="balanced 下允许超速的秒数")
     input_weight: float = Field(default=1.0, ge=0, description="输入 token 倍率")
     output_weight: float = Field(default=1.0, ge=0, description="输出 token 倍率")
 class BudgetConfig(PluginConfigBase):
     __ui_label__ = "动态预算"
     __ui_icon__ = "wallet"
     __ui_order__ = 4
-    enabled: bool = Field(default=False, description="启用后只使用动态预算，不叠加静态限制")
+    enabled: bool = Field(default=True, description="启用后只使用动态预算，不叠加静态限制")
     items: list[BudgetRuleConfig] = Field(default_factory=list, description="每日成本或 token 预算")
 
 class ErrorThresholdRule(PluginConfigBase):
@@ -90,10 +88,10 @@ class ErrorThresholdRule(PluginConfigBase):
     error_type: str = Field(default="*", description="错误类型：429 / 5xx / timeout / *")
     window_seconds: int = Field(default=120, ge=1, description="滑动窗口秒数")
     threshold: int = Field(default=5, ge=1, description="窗口内达到该次数则停入站")
-    hold_seconds: int = Field(default=90, ge=1, description="基础停止秒数；连续触发且中间无成功调用时按次数线性倍增")
+    hold_seconds: int = Field(default=90, ge=1, description="停止秒数")
     hold_max_seconds: int = Field(default=3600, ge=1, description="停止秒数上限")
 class ErrorRulesConfig(PluginConfigBase):
-    __ui_label__ = "错误阈值停模"
+    __ui_label__ = "错误阈值"
     __ui_icon__ = "shield-off"
     __ui_order__ = 5
     enabled: bool = Field(default=True, description="错误次数达限时停止入站；与消耗限速可同时生效")
@@ -242,8 +240,6 @@ class HoldOnPlugin(MaiBotPlugin):
             start,
             end,
             self.config.stats.usage_limit,
-            input_weight=float(self.config.stats.input_weight),
-            output_weight=float(self.config.stats.output_weight),
         )
 
     def _period(self, now: datetime, item: BudgetRuleConfig) -> tuple[datetime, datetime]:
@@ -274,7 +270,7 @@ class HoldOnPlugin(MaiBotPlugin):
                     item.input_weight,
                     item.output_weight,
                     item.strategy,
-                    item.overshoot_ratio,
+                    item.overshoot_time,
                 )
                 decision = check_budget(metrics["groups"], rule, now)
                 if decision:
@@ -500,7 +496,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 item.input_weight,
                 item.output_weight,
                 item.strategy,
-                item.overshoot_ratio,
+                item.overshoot_time,
             )
         return None
 
