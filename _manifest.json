@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "3.0.1",
+  "version": "3.1.0",
   "name": "稍，稍等一下！",
   "description": "为 模型/厂商/功能 提供RPM，智能限速",
   "author": {
