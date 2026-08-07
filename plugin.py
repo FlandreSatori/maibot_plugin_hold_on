@@ -448,10 +448,12 @@ class HoldOnPlugin(MaiBotPlugin):
             return
         label = HoldOnPolicy.scope_label(event.scope)
         dist = HoldOnPolicy.format_distribution(dict(event.distribution or {}))
+        streak = max(1, int(event.streak or 1))
         text = (
             "停止响应：\n"
             f"- {label}:{event.name or '*'} 在 {event.window_seconds}s 内达到 "
-            f"{event.count}/{event.threshold}，停止 {event.hold_seconds}s\n"
+            f"{event.count}/{event.threshold}，停止 {event.hold_seconds}s"
+            f"（连续第 {streak} 次）\n"
             f"-> {dist}"
         )
         await self._send_notify(text)

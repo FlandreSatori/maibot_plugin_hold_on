@@ -147,22 +147,9 @@ class HoldOnPolicy:
             if count < int(rule.threshold):
                 continue
 
-            was_holding = self.state.is_holding()
-            if was_holding:
-                # 已在停止中：只延长到当前档位时长，不重复加档、不重复通知
-                streak = max(1, self.state.error_hold_streak)
-                hold_seconds = self.linear_hold_seconds(rule, streak)
-                reason = (
-                    f"{self.scope_label(rule.scope)}:{target_name or '*'} "
-                    f"在 {rule.window_seconds}s 内达到 {count}/{rule.threshold}"
-                )
-                self.state.activate_hold(
-                    seconds=float(hold_seconds),
-                    reason=reason,
-                    rule_scope=rule.scope,
-                    rule_name=target_name,
-                    error_type=rule.error_type or error_type,
-                )
+            # 已在停止中：不滑窗续期、不加档；否则错误洪峰会把 until 一直推成「再 90s」，
+            # 档位永远到不了 2x/3x，通知也就一直显示 90s。到期后再触发才叠加。
+            if self.state.is_holding():
                 continue
 
             streak = self.state.bump_error_hold_streak()
