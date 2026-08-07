@@ -71,8 +71,16 @@ class BudgetRuleConfig(PluginConfigBase):
     amount: float = Field(default=100, gt=0, description="周期总额度")
     start_time: str = Field(default="08:00", description="每日周期开始，HH:MM")
     end_time: str = Field(default="22:00", description="每日周期结束，HH:MM")
-    strategy: Literal["strict", "balanced"] = Field(default="strict", description="超速策略：strict 不超速；balanced 允许在 overshoot_time 秒内超速")
+    strategy: Literal["strict", "balanced"] = Field(
+        default="strict",
+        description="超速策略：strict 不超速；balanced 允许在 overshoot_time 秒内超速",
+    )
     overshoot_time: float = Field(default=300, ge=0, description="balanced 下允许超速的秒数")
+    off_hours: Literal["hold", "continue"] = Field(
+        default="continue",
+        description="预算时段外：hold=停止响应；continue=不控速，继续花完剩余额度（用尽后仍停止）",
+        json_schema_extra={"label": "时段外行为"},
+    )
     input_weight: float = Field(default=1.0, ge=0, description="输入 token 倍率")
     output_weight: float = Field(default=1.0, ge=0, description="输出 token 倍率")
 class BudgetConfig(PluginConfigBase):
@@ -256,10 +264,40 @@ class HoldOnPlugin(MaiBotPlugin):
             end -= timedelta(days=1)
         return start, end
 
+    def _in_budget_hours(self, now: datetime, item: BudgetRuleConfig) -> bool:
+        start, end = self._period(now, item)
+        return start <= now <= end
+
+    def _seconds_until_next_budget_start(self, now: datetime, item: BudgetRuleConfig) -> float:
+        def parse(value: str) -> time:
+            hour, minute = (int(x) for x in value.split(":", 1))
+            return time(hour, minute)
+
+        candidate = datetime.combine(now.date(), parse(item.start_time))
+        if now >= candidate:
+            candidate += timedelta(days=1)
+        return max(60.0, (candidate - now).total_seconds())
+
     def _decision(self, metrics: Dict[str, Any], now: datetime) -> Optional[Decision]:
         if self.config.budget.enabled and self.config.budget.items:
             for item in self.config.budget.items:
                 start, end = self._period(now, item)
+                in_hours = self._in_budget_hours(now, item)
+                if not in_hours and str(item.off_hours or "continue") == "hold":
+                    hold_seconds = self._seconds_until_next_budget_start(now, item)
+                    return Decision(
+                        True,
+                        f"{item.scope}:{item.target or '*'} 预算时段外停止响应",
+                        str(item.scope),
+                        str(item.target or ""),
+                        str(item.metric),
+                        0.0,
+                        0.0,
+                        0.0,
+                        "off_hours",
+                        hold_seconds,
+                    )
+                # 时段内：按策略控速；时段外 continue：只拦总额（计划曲线已到 100%）
                 rule = BudgetRule(
                     item.scope,
                     item.target,
@@ -416,6 +454,25 @@ class HoldOnPlugin(MaiBotPlugin):
             f"{event.count}/{event.threshold}，停止 {event.hold_seconds}s\n"
             f"-> {dist}"
         )
+        await self._send_notify(text)
+
+    async def _notify_rate_limit(self, decision: Decision) -> None:
+        if not bool(self.config.notify.enabled):
+            return
+        label = HoldOnPolicy.scope_label(decision.scope)
+        name = decision.target or "*"
+        hold_seconds = int(max(1.0, float(decision.hold_seconds or 60)))
+        if decision.kind == "off_hours":
+            detail = f"{label}:{name} 预算时段外停止响应，停止 {hold_seconds}s"
+        else:
+            detail = (
+                f"{label}:{name} {decision.metric} "
+                f"{decision.actual:g}/{decision.limit:g}，停止 {hold_seconds}s"
+            )
+        text = f"停止响应：\n- {detail}\n-> {decision.reason}"
+        await self._send_notify(text)
+
+    async def _send_notify(self, text: str) -> None:
         prefix = str(self.config.notify.prefix or "[hold_on]").rstrip()
         outbound = f"{prefix}{text}"
         try:
@@ -587,6 +644,8 @@ class HoldOnPlugin(MaiBotPlugin):
             rem = int(hold.remaining_seconds())
             if rem > 0:
                 lines.append(f"剩余停止：{rem}s")
+        rate_hits = self.state.count_rate_limits(start_ts=start.timestamp(), end_ts=end.timestamp())
+        lines.append(f"限速触发：{rate_hits} 次")
         lines.append("统计：")
         feature_models = {
             str(f.feature): list(f.models or [])
@@ -608,10 +667,16 @@ class HoldOnPlugin(MaiBotPlugin):
                 end_ts=end.timestamp(),
                 feature_models=feature_models,
             )
+            hits = self.state.count_rate_limits(
+                start_ts=start.timestamp(),
+                end_ts=end.timestamp(),
+                scope=scope,
+                target=target,
+            )
             suffix = self._rate_suffix(scope=scope, target=target, groups=groups, now=now)
             lines.append(
                 f"- {target}: 成功 {int(success['requests'])} / 失败 {fails} ，"
-                f"token {int(success['tokens'])} ，成本 {success['cost']:.5f}"
+                f"限速 {hits} ，token {int(success['tokens'])} ，成本 {success['cost']:.5f}"
                 f"{suffix}"
             )
         return "\n".join(lines)
@@ -631,13 +696,22 @@ class HoldOnPlugin(MaiBotPlugin):
         await self._maybe_reset_error_streak()
         decision = await self._check()
         if decision:
-            self.state.activate_hold(
-                seconds=60,
+            newly = self.state.activate_hold(
+                seconds=float(decision.hold_seconds or 60),
                 reason=decision.reason,
                 rule_scope=decision.scope,
                 rule_name=decision.target,
                 error_type=decision.metric,
             )
+            if newly:
+                self.state.record_rate_limit(
+                    scope=decision.scope,
+                    target=decision.target,
+                    metric=decision.metric,
+                    kind=decision.kind,
+                    reason=decision.reason,
+                )
+                await self._notify_rate_limit(decision)
         return {"action": "abort"} if self.state.is_holding() else {"action": "continue"}
 
     @staticmethod

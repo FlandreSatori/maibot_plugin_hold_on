@@ -37,6 +37,8 @@ class Decision:
     actual: float = 0.0
     limit: float = 0.0
     remaining: float = 0.0
+    kind: str = "rate"  # rate / off_hours
+    hold_seconds: float = 60.0
 
 
 def metric_value(group: Dict[str, Any], metric: str, input_weight: float = 1.0, output_weight: float = 1.0) -> float:
@@ -54,13 +56,27 @@ def check_static(groups: Iterable[Dict[str, Any]], rule: LimitRule) -> Optional[
         if matches(group, rule.scope, rule.target):
             value = metric_value(group, rule.metric, rule.input_weight, rule.output_weight)
             if value >= rule.limit:
-                return Decision(True, f"{rule.scope}:{rule.target or group.get(rule.scope)} {rule.metric} {value:g}/{rule.limit:g}", rule.scope, str(rule.target or group.get(rule.scope) or ""), rule.metric, value, rule.limit)
+                return Decision(
+                    True,
+                    f"{rule.scope}:{rule.target or group.get(rule.scope)} {rule.metric} {value:g}/{rule.limit:g}",
+                    rule.scope,
+                    str(rule.target or group.get(rule.scope) or ""),
+                    rule.metric,
+                    value,
+                    rule.limit,
+                    max(0.0, float(rule.limit) - value),
+                    "rate",
+                    60.0,
+                )
     return None
 
 
 def check_budget(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: datetime) -> Optional[Decision]:
     progress = budget_progress(groups, rule, now)
     if progress["actual"] > progress["allowance"]:
+        # 静默到计划曲线追上当前实际消耗所需时间，至少 60s
+        plan_speed = max(1e-9, float(progress["plan_speed"]))
+        catch_up = max(60.0, (progress["actual"] - progress["allowance"]) / plan_speed)
         return Decision(
             True,
             f"{rule.scope}:{rule.target or '*'} {rule.metric} 预算超速 {progress['actual']:g}/{progress['allowance']:g}",
@@ -70,6 +86,8 @@ def check_budget(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: dateti
             progress["actual"],
             progress["allowance"],
             progress["remaining"],
+            "rate",
+            catch_up,
         )
     return None
 

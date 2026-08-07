@@ -69,6 +69,7 @@ class HoldOnState:
         self._model_provider: Dict[str, str] = {}
         self._error_hold_streak: int = 0
         self._hold_ended_ts: float = 0.0
+        self._rate_limit_events: List[Dict[str, Any]] = []
         self.load()
 
     def load(self) -> None:
@@ -110,6 +111,23 @@ class HoldOnState:
                 }
             self._error_hold_streak = max(0, int(raw.get("error_hold_streak") or 0))
             self._hold_ended_ts = float(raw.get("hold_ended_ts") or 0)
+            rate_events = raw.get("rate_limit_events") or []
+            if isinstance(rate_events, list):
+                loaded_rate: List[Dict[str, Any]] = []
+                for item in rate_events:
+                    if not isinstance(item, dict):
+                        continue
+                    loaded_rate.append(
+                        {
+                            "ts": float(item.get("ts") or 0),
+                            "scope": str(item.get("scope") or ""),
+                            "target": str(item.get("target") or ""),
+                            "metric": str(item.get("metric") or ""),
+                            "kind": str(item.get("kind") or "rate"),
+                            "reason": str(item.get("reason") or ""),
+                        }
+                    )
+                self._rate_limit_events = loaded_rate[-self._max_events :]
 
     def save(self) -> None:
         with self._lock:
@@ -127,6 +145,7 @@ class HoldOnState:
                 "model_provider": dict(self._model_provider),
                 "error_hold_streak": int(self._error_hold_streak),
                 "hold_ended_ts": float(self._hold_ended_ts),
+                "rate_limit_events": list(self._rate_limit_events[-self._max_events :]),
                 "saved_at": time.time(),
             }
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,8 +156,11 @@ class HoldOnState:
     def _prune_locked(self, now: float, keep_seconds: float = 7 * 24 * 3600) -> None:
         cutoff = now - max(3600.0, float(keep_seconds))
         self._events = [e for e in self._events if e.ts >= cutoff]
+        self._rate_limit_events = [e for e in self._rate_limit_events if float(e.get("ts") or 0) >= cutoff]
         if len(self._events) > self._max_events:
             self._events = self._events[-self._max_events :]
+        if len(self._rate_limit_events) > self._max_events:
+            self._rate_limit_events = self._rate_limit_events[-self._max_events :]
 
     def register_model_provider(self, model: str, provider: str) -> None:
         model = str(model or "").strip()
@@ -309,6 +331,53 @@ class HoldOnState:
         with self._lock:
             self._hold_ended_ts = time.time()
             self.save()
+
+    def record_rate_limit(
+        self,
+        *,
+        scope: str = "",
+        target: str = "",
+        metric: str = "",
+        kind: str = "rate",
+        reason: str = "",
+    ) -> None:
+        event = {
+            "ts": time.time(),
+            "scope": str(scope or ""),
+            "target": str(target or ""),
+            "metric": str(metric or ""),
+            "kind": str(kind or "rate"),
+            "reason": str(reason or "")[:300],
+        }
+        with self._lock:
+            self._rate_limit_events.append(event)
+            self._prune_locked(event["ts"])
+            self.save()
+
+    def count_rate_limits(
+        self,
+        *,
+        start_ts: float,
+        end_ts: float,
+        scope: str = "",
+        target: str = "",
+    ) -> int:
+        start = float(start_ts)
+        end = float(end_ts)
+        want_scope = str(scope or "").strip()
+        want_target = str(target or "").strip()
+        total = 0
+        with self._lock:
+            for event in self._rate_limit_events:
+                ts = float(event.get("ts") or 0)
+                if ts < start or ts > end:
+                    continue
+                if want_scope and str(event.get("scope") or "") != want_scope:
+                    continue
+                if want_target and str(event.get("target") or "") != want_target:
+                    continue
+                total += 1
+        return total
 
     def activate_hold(
         self,
