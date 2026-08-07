@@ -19,3 +19,7 @@
 
 - `/稍等`：显示当前窗口的成功调用、Token、成本、错误与限制状态。
 - `/解除`：解除当前停止状态，保留统计。
+
+## 数据语义
+
+成功数据通过宿主已有的 `database.query` 读取 `ModelUsage`（表 `llm_usage`），插件按时间窗自行过滤并聚合；失败来自 `logs/maisaka_prompt/llm_error` 的 schema v3 attempt。不依赖宿主新增统计 capability。

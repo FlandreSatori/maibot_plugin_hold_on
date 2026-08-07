@@ -140,36 +140,70 @@ class HoldOnPlugin(MaiBotPlugin):
     def _active(self) -> bool:
         return bool(self.config.plugin.enabled)
     async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
-        return await aggregate_usage(self.ctx, start, end, self.config.stats.usage_limit)
+        return await aggregate_usage(
+            self.ctx,
+            start,
+            end,
+            self.config.stats.usage_limit,
+            input_weight=float(self.config.stats.input_weight),
+            output_weight=float(self.config.stats.output_weight),
+        )
+
     def _period(self, now: datetime, item: BudgetRuleConfig) -> tuple[datetime, datetime]:
         def parse(value: str) -> time:
             hour, minute = (int(x) for x in value.split(":", 1))
             return time(hour, minute)
-        start_t, end_t = parse(item.start_time), parse(item.end_time)
-        start = datetime.combine(now.date(), start_t)
-        end = datetime.combine(now.date(), end_t)
+
+        start = datetime.combine(now.date(), parse(item.start_time))
+        end = datetime.combine(now.date(), parse(item.end_time))
         if end <= start:
             end += timedelta(days=1)
         if now < start:
             start -= timedelta(days=1)
             end -= timedelta(days=1)
         return start, end
+
     def _decision(self, metrics: Dict[str, Any], now: datetime) -> Optional[Decision]:
         if self.config.budget.enabled and self.config.budget.items:
-            start, end = self._period(now)
             for item in self.config.budget.items:
-                rule = BudgetRule(item.scope, item.target, item.metric, item.amount, start, end, item.input_weight, item.output_weight, item.strategy, item.overshoot_ratio)
+                start, end = self._period(now, item)
+                rule = BudgetRule(
+                    item.scope,
+                    item.target,
+                    item.metric,
+                    item.amount,
+                    start,
+                    end,
+                    item.input_weight,
+                    item.output_weight,
+                    item.strategy,
+                    item.overshoot_ratio,
+                )
                 decision = check_budget(metrics["groups"], rule, now)
-                if decision: return decision
+                if decision:
+                    return decision
             return None
         if self.config.static_limits.enabled:
             for item in self.config.static_limits.items:
-                rule = LimitRule(item.scope, item.target, item.metric, item.window_seconds, item.limit, item.input_weight, item.output_weight)
+                rule = LimitRule(
+                    item.scope,
+                    item.target,
+                    item.metric,
+                    item.window_seconds,
+                    item.limit,
+                    item.input_weight,
+                    item.output_weight,
+                )
                 decision = check_static(metrics["groups"], rule)
-                if decision: return decision
+                if decision:
+                    return decision
         return None
+
     async def _check(self) -> Optional[Decision]:
         now = datetime.now()
+        if self.config.budget.enabled and self.config.budget.items:
+            starts = [self._period(now, item)[0] for item in self.config.budget.items]
+            return self._decision(await self._usage(min(starts), now), now)
         start = now - timedelta(seconds=self.config.stats.window_seconds)
         return self._decision(await self._usage(start, now), now)
     async def _on_snapshot_error(self, *, model_name: str = "", provider: str = "", message: str = "", error_type: str = "", error: Optional[dict] = None, source_path: str = "", **_: Any) -> None:
@@ -197,8 +231,33 @@ class HoldOnPlugin(MaiBotPlugin):
     async def cmd_status(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")): return await self._send(stream_id, "权限不足。")
-        now = datetime.now(); metrics = await self._usage(now - timedelta(seconds=self.config.stats.window_seconds), now); decision = self._decision(metrics, now)
-        return await self._send(stream_id, f"【稍等状态】\n成功调用: {int(metrics['total']['requests'])}\nToken: {int(metrics['total']['tokens'])}\n成本: {metrics['total']['cost']:.4f}\n状态: {'限制中' if self.state.is_holding() or decision else '正常'}")
+        now = datetime.now()
+        if self.config.budget.enabled and self.config.budget.items:
+            start = min(self._period(now, item)[0] for item in self.config.budget.items)
+        else:
+            start = now - timedelta(seconds=self.config.stats.window_seconds)
+        metrics = await self._usage(start, now)
+        decision = self._decision(metrics, now)
+        total = metrics["total"]
+        lines = [
+            "【稍等状态】",
+            f"统计范围: {start:%m-%d %H:%M} 至 {now:%m-%d %H:%M}",
+            f"成功调用: {int(total['requests'])}",
+            f"输入Token: {int(total['input_tokens'])}",
+            f"输出Token: {int(total['output_tokens'])}",
+            f"加权Token: {total['weighted_tokens']:.0f}",
+            f"成本: {total['cost']:.4f}",
+            f"状态: {'限制中' if self.state.is_holding() or decision else '正常'}",
+        ]
+        if decision:
+            lines.append(f"命中: {decision.reason}")
+        for group in metrics["groups"][:20]:
+            label = group.get("feature") or group.get("model") or group.get("provider") or "unknown"
+            lines.append(
+                f"- {label}: 请求{int(group['requests'])} "
+                f"Token{int(group['tokens'])} 成本{group['cost']:.4f}"
+            )
+        return await self._send(stream_id, "\n".join(lines))
     @Command("holdon_clear", description="解除限制", pattern=r"/解除\s*$")
     async def cmd_clear(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
