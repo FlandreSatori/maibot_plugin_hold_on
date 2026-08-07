@@ -147,9 +147,8 @@ class HoldOnPolicy:
             if count < int(rule.threshold):
                 continue
 
-            # 已在停止中：不滑窗续期、不加档；否则错误洪峰会把 until 一直推成「再 90s」，
-            # 档位永远到不了 2x/3x，通知也就一直显示 90s。到期后再触发才叠加。
-            if self.state.is_holding():
+            # 仅在「错误停模」进行中跳过；限速停模不挡错误加档（额度用尽时常一直占着 is_holding）
+            if self.state.is_error_holding():
                 continue
 
             streak = self.state.bump_error_hold_streak()
@@ -158,14 +157,15 @@ class HoldOnPolicy:
                 f"{self.scope_label(rule.scope)}:{target_name or '*'} "
                 f"在 {rule.window_seconds}s 内达到 {count}/{rule.threshold}"
             )
-            newly = self.state.activate_hold(
+            self.state.activate_hold(
                 seconds=float(hold_seconds),
                 reason=reason,
                 rule_scope=rule.scope,
                 rule_name=target_name,
                 error_type=rule.error_type or error_type,
+                source="error",
             )
-            if newly and triggered is None:
+            if triggered is None:
                 dist = self.state.error_type_distribution(
                     scope=rule.scope,
                     target=target_name,

@@ -43,6 +43,7 @@ class StatEvent:
 @dataclass
 class HoldInfo:
     until_ts: float = 0.0
+    error_until_ts: float = 0.0  # 仅错误阈值停模；与限速 until 分离，避免档位被卡住
     reason: str = ""
     rule_scope: str = ""
     rule_name: str = ""
@@ -68,7 +69,9 @@ class HoldOnState:
         self._hold = HoldInfo()
         self._model_provider: Dict[str, str] = {}
         self._error_hold_streak: int = 0
-        self._hold_ended_ts: float = 0.0
+        self._hold_ended_ts: float = 0.0  # 最近一次「错误停模」结束时间
+        self._streak_scope: str = ""
+        self._streak_target: str = ""
         self._rate_limit_events: List[Dict[str, Any]] = []
         self.load()
 
@@ -96,6 +99,7 @@ class HoldOnState:
             if isinstance(hold, dict):
                 self._hold = HoldInfo(
                     until_ts=float(hold.get("until_ts") or 0),
+                    error_until_ts=float(hold.get("error_until_ts") or 0),
                     reason=str(hold.get("reason") or ""),
                     rule_scope=str(hold.get("rule_scope") or ""),
                     rule_name=str(hold.get("rule_name") or ""),
@@ -111,6 +115,8 @@ class HoldOnState:
                 }
             self._error_hold_streak = max(0, int(raw.get("error_hold_streak") or 0))
             self._hold_ended_ts = float(raw.get("hold_ended_ts") or 0)
+            self._streak_scope = str(raw.get("streak_scope") or self._hold.rule_scope or "")
+            self._streak_target = str(raw.get("streak_target") or self._hold.rule_name or "")
             rate_events = raw.get("rate_limit_events") or []
             if isinstance(rate_events, list):
                 loaded_rate: List[Dict[str, Any]] = []
@@ -136,6 +142,7 @@ class HoldOnState:
                 "events": [e.to_dict() for e in self._events[-self._max_events :]],
                 "hold": {
                     "until_ts": self._hold.until_ts,
+                    "error_until_ts": self._hold.error_until_ts,
                     "reason": self._hold.reason,
                     "rule_scope": self._hold.rule_scope,
                     "rule_name": self._hold.rule_name,
@@ -145,6 +152,8 @@ class HoldOnState:
                 "model_provider": dict(self._model_provider),
                 "error_hold_streak": int(self._error_hold_streak),
                 "hold_ended_ts": float(self._hold_ended_ts),
+                "streak_scope": str(self._streak_scope or ""),
+                "streak_target": str(self._streak_target or ""),
                 "rate_limit_events": list(self._rate_limit_events[-self._max_events :]),
                 "saved_at": time.time(),
             }
@@ -281,27 +290,6 @@ class HoldOnState:
             total += 1
         return total
 
-    def is_holding(self, now: Optional[float] = None) -> bool:
-        with self._lock:
-            if not self._hold.is_active(now):
-                if self._hold.until_ts:
-                    self._hold = HoldInfo()
-                    self._hold_ended_ts = time.time() if now is None else float(now)
-                    self.save()
-                return False
-            return True
-
-    def hold_info(self) -> HoldInfo:
-        with self._lock:
-            return HoldInfo(
-                until_ts=self._hold.until_ts,
-                reason=self._hold.reason,
-                rule_scope=self._hold.rule_scope,
-                rule_name=self._hold.rule_name,
-                error_type=self._hold.error_type,
-                activated_ts=self._hold.activated_ts,
-            )
-
     @property
     def error_hold_streak(self) -> int:
         with self._lock:
@@ -321,9 +309,11 @@ class HoldOnState:
 
     def reset_error_hold_streak(self) -> None:
         with self._lock:
-            if self._error_hold_streak or self._hold_ended_ts:
+            if self._error_hold_streak or self._hold_ended_ts or self._streak_scope or self._streak_target:
                 self._error_hold_streak = 0
                 self._hold_ended_ts = 0.0
+                self._streak_scope = ""
+                self._streak_target = ""
                 self.save()
 
     def mark_hold_ended(self) -> None:
@@ -331,6 +321,67 @@ class HoldOnState:
         with self._lock:
             self._hold_ended_ts = time.time()
             self.save()
+
+    def streak_target(self) -> tuple[str, str]:
+        with self._lock:
+            return str(self._streak_scope or ""), str(self._streak_target or "")
+
+    def _sync_expiry_locked(self, now: float) -> None:
+        """清理到期停模；仅错误停模到期时写入 hold_ended_ts。"""
+        changed = False
+        hold = self._hold
+        if float(hold.error_until_ts or 0) > 0 and float(hold.error_until_ts) <= now:
+            if self._error_hold_streak > 0:
+                self._hold_ended_ts = now
+            hold = HoldInfo(
+                until_ts=float(hold.until_ts or 0),
+                error_until_ts=0.0,
+                reason=str(hold.reason or ""),
+                rule_scope=str(hold.rule_scope or ""),
+                rule_name=str(hold.rule_name or ""),
+                error_type=str(hold.error_type or ""),
+                activated_ts=float(hold.activated_ts or now),
+            )
+            self._hold = hold
+            changed = True
+        if float(hold.until_ts or 0) > 0 and float(hold.until_ts) <= now:
+            self._hold = HoldInfo(
+                until_ts=0.0,
+                error_until_ts=0.0,
+                reason="",
+                rule_scope=str(hold.rule_scope or ""),
+                rule_name=str(hold.rule_name or ""),
+                error_type=str(hold.error_type or ""),
+                activated_ts=float(hold.activated_ts or now),
+            )
+            changed = True
+        if changed:
+            self.save()
+
+    def is_error_holding(self, now: Optional[float] = None) -> bool:
+        ts = time.time() if now is None else float(now)
+        with self._lock:
+            self._sync_expiry_locked(ts)
+            return float(self._hold.error_until_ts or 0) > ts
+
+    def is_holding(self, now: Optional[float] = None) -> bool:
+        ts = time.time() if now is None else float(now)
+        with self._lock:
+            self._sync_expiry_locked(ts)
+            return float(self._hold.until_ts or 0) > ts
+
+    def hold_info(self) -> HoldInfo:
+        with self._lock:
+            self._sync_expiry_locked(time.time())
+            return HoldInfo(
+                until_ts=self._hold.until_ts,
+                error_until_ts=self._hold.error_until_ts,
+                reason=self._hold.reason,
+                rule_scope=self._hold.rule_scope,
+                rule_name=self._hold.rule_name,
+                error_type=self._hold.error_type,
+                activated_ts=self._hold.activated_ts,
+            )
 
     def record_rate_limit(
         self,
@@ -387,22 +438,38 @@ class HoldOnState:
         rule_scope: str = "",
         rule_name: str = "",
         error_type: str = "",
+        source: str = "rate",
     ) -> bool:
-        """激活或延长停模；若为新触发返回 True。"""
+        """激活或延长停模；source=error 时单独记录错误停模截止时间。若整体停模为新触发返回 True。"""
 
         now = time.time()
         seconds = max(0.0, float(seconds))
+        source_key = str(source or "rate").strip().lower() or "rate"
         with self._lock:
-            was_active = self._hold.is_active(now)
+            self._sync_expiry_locked(now)
+            was_active = float(self._hold.until_ts or 0) > now
             until = now + seconds
-            if was_active and self._hold.until_ts > until:
-                until = self._hold.until_ts
+            if was_active and float(self._hold.until_ts) > until:
+                until = float(self._hold.until_ts)
+
+            error_until = float(self._hold.error_until_ts or 0)
+            scope = str(rule_scope or self._hold.rule_scope or "")
+            name = str(rule_name or self._hold.rule_name or "")
+            etype = str(error_type or self._hold.error_type or "")
+            if source_key == "error":
+                error_until = now + seconds
+                self._streak_scope = scope
+                self._streak_target = name
+            elif error_until <= now:
+                error_until = 0.0
+
             self._hold = HoldInfo(
                 until_ts=until,
+                error_until_ts=error_until if error_until > now else 0.0,
                 reason=str(reason or ""),
-                rule_scope=str(rule_scope or ""),
-                rule_name=str(rule_name or ""),
-                error_type=str(error_type or ""),
+                rule_scope=scope,
+                rule_name=name,
+                error_type=etype,
                 activated_ts=self._hold.activated_ts if was_active else now,
             )
             self.save()
@@ -410,10 +477,16 @@ class HoldOnState:
 
     def clear_hold(self) -> bool:
         with self._lock:
-            had = self._hold.is_active() or bool(self._hold.until_ts)
-            self._hold = HoldInfo()
+            now = time.time()
+            had = float(self._hold.until_ts or 0) > now or float(self._hold.error_until_ts or 0) > now
+            had_error = float(self._hold.error_until_ts or 0) > now
+            scope = str(self._hold.rule_scope or "")
+            name = str(self._hold.rule_name or "")
+            etype = str(self._hold.error_type or "")
+            self._hold = HoldInfo(rule_scope=scope, rule_name=name, error_type=etype)
             if had:
-                self._hold_ended_ts = time.time()
+                if had_error or self._error_hold_streak > 0:
+                    self._hold_ended_ts = now
                 self.save()
             return had
 

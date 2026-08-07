@@ -337,18 +337,34 @@ class HoldOnPlugin(MaiBotPlugin):
             return self._decision(await self._usage(min(starts), now), now)
         start = now - timedelta(seconds=self.config.stats.window_seconds)
         return self._decision(await self._usage(start, now), now)
+    def _scoped_success_count(self, metrics: Dict[str, Any], scope: str, target: str) -> int:
+        """仅统计与上次错误停模目标相同的成功次数；无明确目标则视为 0（避免旁路 LLM 误清档）。"""
+        want_scope = str(scope or "").strip().lower()
+        want_target = str(target or "").strip()
+        if not want_scope or not want_target:
+            return 0
+        total = 0
+        for group in metrics.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            if str(group.get(want_scope) or "").strip() != want_target:
+                continue
+            total += int(group.get("requests") or 0)
+        return total
+
     async def _maybe_reset_error_streak(self) -> None:
-        """解除/到期后若出现成功调用，清零连续错误停模档位。"""
+        """错误停模结束后，仅当「同一目标」出现成功调用时清零档位。"""
         if self.state.error_hold_streak <= 0:
             return
-        if self.state.is_holding():
+        if self.state.is_error_holding():
             return
         anchor = float(self.state.hold_ended_ts or 0)
         if anchor <= 0:
             return
+        scope, target = self.state.streak_target()
         start = datetime.fromtimestamp(anchor)
         metrics = await self._usage(start, datetime.now())
-        if int((metrics.get("total") or {}).get("requests") or 0) > 0:
+        if self._scoped_success_count(metrics, scope, target) > 0:
             self.state.reset_error_hold_streak()
 
     async def _on_snapshot_error(
@@ -704,6 +720,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 rule_scope=decision.scope,
                 rule_name=decision.target,
                 error_type=decision.metric,
+                source="rate",
             )
             if newly:
                 self.state.record_rate_limit(
