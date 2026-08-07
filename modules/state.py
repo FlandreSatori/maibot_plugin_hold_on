@@ -17,6 +17,7 @@ class StatEvent:
     ts: float
     model: str = ""
     provider: str = ""
+    feature: str = ""
     error_type: str = ""
     message: str = ""
 
@@ -33,6 +34,7 @@ class StatEvent:
             ts=float(raw.get("ts") or 0),
             model=str(raw.get("model") or ""),
             provider=str(raw.get("provider") or ""),
+            feature=str(raw.get("feature") or ""),
             error_type=str(raw.get("error_type") or ""),
             message=str(raw.get("message") or ""),
         )
@@ -152,6 +154,7 @@ class HoldOnState:
         *,
         model: str,
         provider: str = "",
+        feature: str = "",
         error_type: str = "other",
         message: str = "",
     ) -> StatEvent:
@@ -161,6 +164,7 @@ class HoldOnState:
             ts=time.time(),
             model=model,
             provider=provider,
+            feature=str(feature or "").strip(),
             error_type=str(error_type or "other").strip() or "other",
             message=str(message or "").strip()[:300],
         )
@@ -177,6 +181,41 @@ class HoldOnState:
         cutoff = ts - max(0.0, float(window_seconds))
         with self._lock:
             return [e for e in self._events if e.ts >= cutoff]
+
+    def events_between(self, start_ts: float, end_ts: float) -> List[StatEvent]:
+        start = float(start_ts)
+        end = float(end_ts)
+        with self._lock:
+            return [e for e in self._events if start <= e.ts <= end]
+
+    def count_errors_for_scope(
+        self,
+        *,
+        scope: str,
+        target: str,
+        start_ts: float,
+        end_ts: float,
+        feature_models: Optional[Dict[str, List[str]]] = None,
+    ) -> int:
+        want = str(target or "").strip()
+        if not want:
+            return 0
+        scope_key = str(scope or "").strip().lower()
+        models = {
+            str(m).strip()
+            for m in ((feature_models or {}).get(want) or [])
+            if str(m).strip()
+        }
+        total = 0
+        for event in self.events_between(start_ts, end_ts):
+            if scope_key == "provider" and event.provider == want:
+                total += 1
+            elif scope_key == "model" and event.model == want:
+                total += 1
+            elif scope_key == "feature":
+                if event.feature == want or (models and event.model in models):
+                    total += 1
+        return total
 
     def count_errors(
         self,

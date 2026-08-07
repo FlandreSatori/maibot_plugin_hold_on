@@ -5,7 +5,15 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
-from .modules.controller import BudgetRule, Decision, LimitRule, check_budget, check_static
+from .modules.controller import (
+    BudgetRule,
+    Decision,
+    LimitRule,
+    budget_progress,
+    check_budget,
+    check_static,
+    static_progress,
+)
 from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
 from .modules.model_discover import discover_models
 from .modules.state import HoldOnState
@@ -206,9 +214,191 @@ class HoldOnPlugin(MaiBotPlugin):
             return self._decision(await self._usage(min(starts), now), now)
         start = now - timedelta(seconds=self.config.stats.window_seconds)
         return self._decision(await self._usage(start, now), now)
-    async def _on_snapshot_error(self, *, model_name: str = "", provider: str = "", message: str = "", error_type: str = "", error: Optional[dict] = None, source_path: str = "", **_: Any) -> None:
-        if not self._active(): return
-        self.state.record_error(model=model_name, provider=provider, error_type=error_type, message=message)
+    async def _on_snapshot_error(self, *, model_name: str = "", provider: str = "", feature: str = "", message: str = "", error_type: str = "", error: Optional[dict] = None, source_path: str = "", **_: Any) -> None:
+        if not self._active():
+            return
+        self.state.record_error(
+            model=model_name,
+            provider=provider,
+            feature=feature,
+            error_type=error_type,
+            message=message,
+        )
+
+    def _active_limit_specs(self) -> list[tuple[str, str]]:
+        """返回当前生效限制目标列表：(scope, target)。target 为空表示该 scope 下各目标分别统计。"""
+        specs: list[tuple[str, str]] = []
+        if self.config.budget.enabled and self.config.budget.items:
+            for item in self.config.budget.items:
+                specs.append((str(item.scope), str(item.target or "").strip()))
+            return specs
+        if self.config.static_limits.enabled:
+            for item in self.config.static_limits.items:
+                specs.append((str(item.scope), str(item.target or "").strip()))
+        return specs
+
+    def _sum_scope_metrics(self, groups: list[Dict[str, Any]], scope: str, target: str) -> Dict[str, float]:
+        total = {"requests": 0.0, "tokens": 0.0, "cost": 0.0}
+        for group in groups:
+            if str(group.get(scope) or "") != target:
+                continue
+            total["requests"] += float(group.get("requests") or 0)
+            total["tokens"] += float(group.get("tokens") or 0)
+            total["cost"] += float(group.get("cost") or 0)
+        return total
+
+    def _status_targets(self, metrics: Dict[str, Any]) -> list[tuple[str, str]]:
+        groups = list(metrics.get("groups") or [])
+        seen: set[tuple[str, str]] = set()
+        ordered: list[tuple[str, str]] = []
+        for scope, target in self._active_limit_specs():
+            if target:
+                key = (scope, target)
+                if key not in seen:
+                    seen.add(key)
+                    ordered.append(key)
+                continue
+            for group in groups:
+                name = str(group.get(scope) or "").strip()
+                if not name:
+                    continue
+                key = (scope, name)
+                if key not in seen:
+                    seen.add(key)
+                    ordered.append(key)
+        return ordered
+
+    def _find_budget_rule(self, scope: str, target: str, now: datetime) -> Optional[BudgetRule]:
+        for item in self.config.budget.items:
+            if str(item.scope) != scope:
+                continue
+            configured = str(item.target or "").strip()
+            if configured and configured != target:
+                continue
+            start, end = self._period(now, item)
+            return BudgetRule(
+                item.scope,
+                target,
+                item.metric,
+                item.amount,
+                start,
+                end,
+                item.input_weight,
+                item.output_weight,
+                item.strategy,
+                item.overshoot_ratio,
+            )
+        return None
+
+    def _find_static_rule(self, scope: str, target: str) -> Optional[LimitRule]:
+        for item in self.config.static_limits.items:
+            if str(item.scope) != scope:
+                continue
+            configured = str(item.target or "").strip()
+            if configured and configured != target:
+                continue
+            return LimitRule(
+                item.scope,
+                target,
+                item.metric,
+                item.window_seconds,
+                item.limit,
+                item.input_weight,
+                item.output_weight,
+            )
+        return None
+
+    @staticmethod
+    def _format_amount(value: float, metric: str) -> str:
+        if metric == "cost":
+            return f"{value:.5f}"
+        if metric == "requests":
+            return f"{int(value)}"
+        return f"{value:.0f}"
+
+    @staticmethod
+    def _format_rate(value: float, metric: str) -> str:
+        unit = {"cost": "成本/秒", "tokens": "token/秒", "requests": "次/秒"}.get(metric, "/秒")
+        if metric == "cost":
+            return f"{value:.5f}{unit}"
+        if value >= 10:
+            return f"{value:.1f}{unit}"
+        return f"{value:.2f}{unit}"
+
+    def _rate_suffix(
+        self,
+        *,
+        scope: str,
+        target: str,
+        groups: list[Dict[str, Any]],
+        now: datetime,
+    ) -> str:
+        if self.config.budget.enabled and self.config.budget.items:
+            rule = self._find_budget_rule(scope, target, now)
+            if rule is None:
+                return ""
+            progress = budget_progress(groups, rule, now)
+            remain_label = "成本" if rule.metric == "cost" else "token"
+            return (
+                f" ，剩余{remain_label} {self._format_amount(progress['remaining'], rule.metric)}"
+                f" ，实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
+                f" ，计划速度 {self._format_rate(progress['recover_speed'], rule.metric)}"
+            )
+
+        rule = self._find_static_rule(scope, target)
+        if rule is None:
+            return ""
+        progress = static_progress(groups, rule)
+        remain_label = {"cost": "成本", "tokens": "token", "requests": "次数"}.get(rule.metric, rule.metric)
+        return (
+            f" ，剩余{remain_label} {self._format_amount(progress['remaining'], rule.metric)}"
+            f" ，实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
+            f" ，限额速度 {self._format_rate(progress['plan_speed'], rule.metric)}"
+        )
+
+    def _status_text(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        metrics: Dict[str, Any],
+        holding: bool,
+        now: Optional[datetime] = None,
+    ) -> str:
+        now = now or end
+        lines = [
+            f"【{start:%m-%d}: {start:%H:%M} ~ {end:%H:%M}】",
+            f"状态：{'停止响应' if holding else '正常响应'}",
+            "统计：",
+        ]
+        feature_models = {
+            str(f.feature): list(f.models or [])
+            for f in (self.config.catalog.features or [])
+            if str(f.feature or "").strip()
+        }
+        groups = list(metrics.get("groups") or [])
+        targets = self._status_targets(metrics)
+        if not targets:
+            lines.append("- （当前没有生效的速率限制目标）")
+            return "\n".join(lines)
+
+        for scope, target in targets:
+            success = self._sum_scope_metrics(groups, scope, target)
+            fails = self.state.count_errors_for_scope(
+                scope=scope,
+                target=target,
+                start_ts=start.timestamp(),
+                end_ts=end.timestamp(),
+                feature_models=feature_models,
+            )
+            suffix = self._rate_suffix(scope=scope, target=target, groups=groups, now=now)
+            lines.append(
+                f"- {target}: 成功 {int(success['requests'])} / 失败 {fails} ，"
+                f"token {int(success['tokens'])} ，成本 {success['cost']:.5f}"
+                f"{suffix}"
+            )
+        return "\n".join(lines)
+
     async def _is_admin(self, platform: str, user_id: str) -> bool:
         uid = str(user_id or "").strip()
         scoped = f"{platform}:{uid}" if platform else uid
@@ -230,34 +420,29 @@ class HoldOnPlugin(MaiBotPlugin):
     @Command("holdon_status", description="查看当前消耗与限制", pattern=r"/稍等\s*$")
     async def cmd_status(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
-        if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")): return await self._send(stream_id, "权限不足。")
+        if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
+            return await self._send(stream_id, "权限不足。")
         now = datetime.now()
         if self.config.budget.enabled and self.config.budget.items:
             start = min(self._period(now, item)[0] for item in self.config.budget.items)
+            end = max(self._period(now, item)[1] for item in self.config.budget.items)
+            display_end = min(now, end)
         else:
             start = now - timedelta(seconds=self.config.stats.window_seconds)
+            display_end = now
         metrics = await self._usage(start, now)
         decision = self._decision(metrics, now)
-        total = metrics["total"]
-        lines = [
-            "【稍等状态】",
-            f"统计范围: {start:%m-%d %H:%M} 至 {now:%m-%d %H:%M}",
-            f"成功调用: {int(total['requests'])}",
-            f"输入Token: {int(total['input_tokens'])}",
-            f"输出Token: {int(total['output_tokens'])}",
-            f"加权Token: {total['weighted_tokens']:.0f}",
-            f"成本: {total['cost']:.4f}",
-            f"状态: {'限制中' if self.state.is_holding() or decision else '正常'}",
-        ]
-        if decision:
-            lines.append(f"命中: {decision.reason}")
-        for group in metrics["groups"][:20]:
-            label = group.get("feature") or group.get("model") or group.get("provider") or "unknown"
-            lines.append(
-                f"- {label}: 请求{int(group['requests'])} "
-                f"Token{int(group['tokens'])} 成本{group['cost']:.4f}"
-            )
-        return await self._send(stream_id, "\n".join(lines))
+        holding = self.state.is_holding() or bool(decision)
+        return await self._send(
+            stream_id,
+            self._status_text(
+                start=start,
+                end=display_end,
+                metrics=metrics,
+                holding=holding,
+                now=now,
+            ),
+        )
     @Command("holdon_clear", description="解除限制", pattern=r"/解除\s*$")
     async def cmd_clear(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")

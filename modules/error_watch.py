@@ -157,10 +157,18 @@ class ErrorSnapshotWatcher:
                 json.dumps(body, ensure_ascii=False) if not isinstance(body, str) else body
             )
         message = "\n".join(p for p in message_parts if p).strip() or "模型请求失败"
+        feature = str(
+            attempt.get("task_name")
+            or attempt.get("request_type")
+            or metadata.get("task_name")
+            or metadata.get("request_type")
+            or ""
+        ).strip()
 
         return {
             "model_name": model_name,
             "provider": provider,
+            "feature": feature,
             "message": message,
             "error_type": classify_error(message, error=error),
             "error": error,

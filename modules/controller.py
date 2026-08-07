@@ -59,17 +59,63 @@ def check_static(groups: Iterable[Dict[str, Any]], rule: LimitRule) -> Optional[
 
 
 def check_budget(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: datetime) -> Optional[Decision]:
-    elapsed = max(0.0, min((now - rule.start).total_seconds(), (rule.end - rule.start).total_seconds()))
+    progress = budget_progress(groups, rule, now)
+    if progress["actual"] > progress["allowance"]:
+        return Decision(
+            True,
+            f"{rule.scope}:{rule.target or '*'} {rule.metric} 预算超速 {progress['actual']:g}/{progress['allowance']:g}",
+            rule.scope,
+            rule.target,
+            rule.metric,
+            progress["actual"],
+            progress["allowance"],
+            progress["remaining"],
+        )
+    return None
+
+
+def budget_progress(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: datetime) -> Dict[str, float]:
     duration = max(1.0, (rule.end - rule.start).total_seconds())
+    elapsed = max(0.0, min((now - rule.start).total_seconds(), duration))
+    remaining_seconds = max(0.0, (rule.end - now).total_seconds())
     expected = rule.amount * elapsed / duration
     actual = 0.0
     for group in groups:
         if matches(group, rule.scope, rule.target):
             actual += metric_value(group, rule.metric, rule.input_weight, rule.output_weight)
-    allowance = rule.amount * (1.0 + max(0.0, rule.overshoot_ratio))
-    if rule.strategy == "strict": allowance = expected
-    elif rule.strategy == "balanced": allowance = expected + (rule.amount - expected) * max(0.0, min(rule.overshoot_ratio, 1.0))
+    if rule.strategy == "strict":
+        allowance = expected
+    elif rule.strategy == "balanced":
+        allowance = expected + (rule.amount - expected) * max(0.0, min(rule.overshoot_ratio, 1.0))
+    else:
+        allowance = expected * (1.0 + max(0.0, rule.overshoot_ratio))
     remaining = max(0.0, rule.amount - actual)
-    if actual > allowance:
-        return Decision(True, f"{rule.scope}:{rule.target or '*'} {rule.metric} 预算超速 {actual:g}/{allowance:g}", rule.scope, rule.target, rule.metric, actual, allowance, remaining)
-    return None
+    plan_speed = rule.amount / duration
+    actual_speed = actual / elapsed if elapsed > 0 else 0.0
+    recover_speed = remaining / remaining_seconds if remaining_seconds > 0 else 0.0
+    return {
+        "actual": actual,
+        "expected": expected,
+        "allowance": allowance,
+        "remaining": remaining,
+        "elapsed": elapsed,
+        "remaining_seconds": remaining_seconds,
+        "plan_speed": plan_speed,
+        "actual_speed": actual_speed,
+        "recover_speed": recover_speed,
+    }
+
+
+def static_progress(groups: Iterable[Dict[str, Any]], rule: LimitRule) -> Dict[str, float]:
+    actual = 0.0
+    for group in groups:
+        if matches(group, rule.scope, rule.target):
+            actual += metric_value(group, rule.metric, rule.input_weight, rule.output_weight)
+    window = max(1.0, float(rule.window_seconds))
+    return {
+        "actual": actual,
+        "limit": float(rule.limit),
+        "remaining": max(0.0, float(rule.limit) - actual),
+        "actual_speed": actual / window,
+        "plan_speed": float(rule.limit) / window,
+    }
