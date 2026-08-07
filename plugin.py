@@ -16,6 +16,7 @@ from .modules.controller import (
 )
 from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
 from .modules.model_discover import discover_models
+from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
 from .modules.state import HoldOnState
 from .modules.usage_sync import aggregate_usage
 
@@ -83,10 +84,38 @@ class BudgetConfig(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用后只使用动态预算，不叠加静态限制")
     items: list[BudgetRuleConfig] = Field(default_factory=list, description="每日成本或 token 预算")
 
+class ErrorThresholdRule(PluginConfigBase):
+    scope: Literal["provider", "model", "feature"] = Field(default="feature", description="计数范围")
+    name: str = Field(default="", description="目标名；空表示按实际命中目标各自计数")
+    error_type: str = Field(default="*", description="错误类型：429 / 5xx / timeout / *")
+    window_seconds: int = Field(default=120, ge=1, description="滑动窗口秒数")
+    threshold: int = Field(default=5, ge=1, description="窗口内达到该次数则停入站")
+    hold_seconds: int = Field(default=90, ge=1, description="基础停止秒数；连续触发且中间无成功调用时按次数线性倍增")
+    hold_max_seconds: int = Field(default=3600, ge=1, description="停止秒数上限")
+class ErrorRulesConfig(PluginConfigBase):
+    __ui_label__ = "错误阈值停模"
+    __ui_icon__ = "shield-off"
+    __ui_order__ = 5
+    enabled: bool = Field(default=True, description="错误次数达限时停止入站；与消耗限速可同时生效")
+    items: list[ErrorThresholdRule] = Field(
+        default_factory=lambda: [
+            ErrorThresholdRule(
+                scope="feature",
+                name="",
+                error_type="*",
+                window_seconds=120,
+                threshold=5,
+                hold_seconds=90,
+                hold_max_seconds=3600,
+            )
+        ],
+        description="错误阈值规则列表",
+    )
+
 class ErrorWatchConfig(PluginConfigBase):
     __ui_label__ = "错误统计"
     __ui_icon__ = "alert-triangle"
-    __ui_order__ = 5
+    __ui_order__ = 6
     enabled: bool = Field(default=True, description="监听 schema v3 错误快照")
     interval_seconds: float = Field(default=2.0, ge=0.5, description="扫描间隔秒数")
     roots: list[str] = Field(default_factory=list, description="额外错误目录")
@@ -94,18 +123,18 @@ class ErrorWatchConfig(PluginConfigBase):
 class NotifyConfig(PluginConfigBase):
     __ui_label__ = "通知"
     __ui_icon__ = "corner-up-right"
-    __ui_order__ = 6
+    __ui_order__ = 7
     enabled: bool = Field(default=False, description="停止入站时转发通知")
     target_type: Literal["group", "private", "stream_id"] = Field(default="group", description="通知目标类型")
     group_id: str = Field(default="", description="群号")
     user_id: str = Field(default="", description="用户 ID")
     stream_id: str = Field(default="", description="stream_id")
     platform: str = Field(default="qq", description="平台")
-    prefix: str = Field(default="[hold_on] ", description="通知前缀")
+    prefix: str = Field(default="[hold_on]", description="通知前缀")
 class PermissionConfig(PluginConfigBase):
     __ui_label__ = "权限"
     __ui_icon__ = "shield"
-    __ui_order__ = 7
+    __ui_order__ = 8
     whitelist: list[str] = Field(default_factory=list, description="管理命令白名单")
     notify_permission_denied: bool = Field(default=True, description="无权限时是否提示")
 class HoldOnConfig(PluginConfigBase):
@@ -114,15 +143,18 @@ class HoldOnConfig(PluginConfigBase):
     catalog: CatalogConfig = Field(default_factory=CatalogConfig)
     static_limits: StaticLimitsConfig = Field(default_factory=StaticLimitsConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    error_rules: ErrorRulesConfig = Field(default_factory=ErrorRulesConfig)
     error_watch: ErrorWatchConfig = Field(default_factory=ErrorWatchConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     permission: PermissionConfig = Field(default_factory=PermissionConfig)
 
 class HoldOnPlugin(MaiBotPlugin):
     config_model = HoldOnConfig
+
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
         self._catalog = await self._discover_catalog()
+        self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
         if self.config.error_watch.enabled and self.config.plugin.enabled:
             self._watcher = ErrorSnapshotWatcher(
@@ -132,19 +164,76 @@ class HoldOnPlugin(MaiBotPlugin):
                 logger=self.ctx.logger,
             )
             self._watcher.start()
+
     async def on_unload(self) -> None:
         if self._watcher:
             await self._watcher.stop()
             self._watcher = None
+
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
         self._catalog = await self._discover_catalog()
+        self.policy = self._build_policy()
+
     async def _discover_catalog(self) -> Dict[str, Any]:
         extra = [self.config.plugin.model_config_path] if self.config.plugin.model_config_path.strip() else []
         result = discover_models(extra)
         if result is None:
-            return {"models": [(m.name, m.provider) for m in self.config.catalog.models], "features": {f.feature: tuple(f.models) for f in self.config.catalog.features}}
-        return {"models": [(m.name, m.provider) for m in result.models], "features": {f.feature: tuple(f.models) for f in result.features}}
+            return {
+                "models": [(m.name, m.provider) for m in self.config.catalog.models],
+                "features": {f.feature: tuple(f.models) for f in self.config.catalog.features},
+            }
+        return {
+            "models": [(m.name, m.provider) for m in result.models],
+            "features": {f.feature: tuple(f.models) for f in result.features},
+        }
+
+    def _build_policy(self) -> HoldOnPolicy:
+        catalog = self._catalog or {}
+        features = [
+            FeatureModels(feature=str(name), models=tuple(models or ()))
+            for name, models in (catalog.get("features") or {}).items()
+            if str(name or "").strip()
+        ]
+        for item in self.config.catalog.features or []:
+            feat = str(item.feature or "").strip()
+            if not feat:
+                continue
+            if any(f.feature == feat for f in features):
+                continue
+            features.append(FeatureModels(feature=feat, models=tuple(item.models or ())))
+        model_providers = {
+            str(name): str(provider or "")
+            for name, provider in (catalog.get("models") or [])
+            if str(name or "").strip()
+        }
+        for item in self.config.catalog.models or []:
+            name = str(item.name or "").strip()
+            if name and name not in model_providers:
+                model_providers[name] = str(item.provider or "")
+        rules: list[ThresholdRule] = []
+        if self.config.error_rules.enabled:
+            rules = [
+                ThresholdRule(
+                    scope=str(r.scope or "model"),
+                    name=str(r.name or "").strip(),
+                    error_type=str(r.error_type or "*").strip() or "*",
+                    window_seconds=int(r.window_seconds or 60),
+                    threshold=int(r.threshold or 0),
+                    hold_seconds=int(r.hold_seconds or 90),
+                    hold_max_seconds=int(r.hold_max_seconds or 3600),
+                )
+                for r in (self.config.error_rules.items or [])
+                if int(r.threshold or 0) > 0
+            ]
+        return HoldOnPolicy(
+            self.state,
+            rules=rules,
+            features=features,
+            model_providers=model_providers,
+            stats_window_seconds=int(self.config.stats.window_seconds or 600),
+        )
+
     def _active(self) -> bool:
         return bool(self.config.plugin.enabled)
     async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
@@ -214,16 +303,141 @@ class HoldOnPlugin(MaiBotPlugin):
             return self._decision(await self._usage(min(starts), now), now)
         start = now - timedelta(seconds=self.config.stats.window_seconds)
         return self._decision(await self._usage(start, now), now)
-    async def _on_snapshot_error(self, *, model_name: str = "", provider: str = "", feature: str = "", message: str = "", error_type: str = "", error: Optional[dict] = None, source_path: str = "", **_: Any) -> None:
+    async def _maybe_reset_error_streak(self) -> None:
+        """解除/到期后若出现成功调用，清零连续错误停模档位。"""
+        if self.state.error_hold_streak <= 0:
+            return
+        if self.state.is_holding():
+            return
+        anchor = float(self.state.hold_ended_ts or 0)
+        if anchor <= 0:
+            return
+        start = datetime.fromtimestamp(anchor)
+        metrics = await self._usage(start, datetime.now())
+        if int((metrics.get("total") or {}).get("requests") or 0) > 0:
+            self.state.reset_error_hold_streak()
+
+    async def _on_snapshot_error(
+        self,
+        *,
+        model_name: str = "",
+        provider: str = "",
+        feature: str = "",
+        message: str = "",
+        error_type: str = "",
+        error: Optional[dict] = None,
+        source_path: str = "",
+        **_: Any,
+    ) -> None:
         if not self._active():
             return
-        self.state.record_error(
-            model=model_name,
+        await self._maybe_reset_error_streak()
+        if not self.config.error_rules.enabled:
+            self.state.record_error(
+                model=model_name,
+                provider=provider,
+                feature=feature,
+                error_type=error_type,
+                message=message,
+            )
+            return
+        event = self.policy.on_error(
+            model_name=model_name,
             provider=provider,
             feature=feature,
-            error_type=error_type,
             message=message,
+            error_type=error_type,
+            error=error,
         )
+        self.ctx.logger.warning(
+            "hold_on 记录错误：model=%s provider=%s feature=%s type=%s path=%s hold=%s",
+            model_name,
+            provider,
+            feature,
+            error_type,
+            Path(source_path).name if source_path else "",
+            bool(event),
+        )
+        if event is not None:
+            await self._notify_hold(event)
+
+    @staticmethod
+    def _pick_stream_id(payload: Any) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload.strip()
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("stream_id", "session_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        nested = payload.get("stream")
+        if isinstance(nested, dict):
+            for key in ("stream_id", "session_id"):
+                value = str(nested.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    async def _resolve_notify_stream_id(self) -> str:
+        cfg = self.config.notify
+        target_type = str(cfg.target_type or "group").strip().lower()
+        platform = str(cfg.platform or "qq").strip() or "qq"
+        if target_type == "stream_id":
+            return str(cfg.stream_id or "").strip()
+        if target_type == "group":
+            group_id = str(cfg.group_id or "").strip()
+            if not group_id:
+                return ""
+            found = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
+            stream_id = self._pick_stream_id(found)
+            if stream_id:
+                return stream_id
+            opened = await self.ctx.chat.open_session(platform=platform, chat_type="group", group_id=group_id)
+            return self._pick_stream_id(opened)
+        if target_type == "private":
+            user_id = str(cfg.user_id or "").strip()
+            if not user_id:
+                return ""
+            found = await self.ctx.chat.get_stream_by_user_id(user_id=user_id, platform=platform)
+            stream_id = self._pick_stream_id(found)
+            if stream_id:
+                return stream_id
+            opened = await self.ctx.chat.open_session(platform=platform, chat_type="private", user_id=user_id)
+            return self._pick_stream_id(opened)
+        return ""
+
+    async def _notify_hold(self, event: HoldEvent) -> None:
+        if not bool(self.config.notify.enabled):
+            return
+        label = HoldOnPolicy.scope_label(event.scope)
+        dist = HoldOnPolicy.format_distribution(dict(event.distribution or {}))
+        text = (
+            "停止响应：\n"
+            f"- {label}:{event.name or '*'} 在 {event.window_seconds}s 内达到 "
+            f"{event.count}/{event.threshold}，停止 {event.hold_seconds}s\n"
+            f"-> {dist}"
+        )
+        prefix = str(self.config.notify.prefix or "[hold_on]").rstrip()
+        outbound = f"{prefix}{text}"
+        try:
+            target = await self._resolve_notify_stream_id()
+        except Exception as exc:
+            self.ctx.logger.error("hold_on 解析通知目标失败: %s", exc, exc_info=True)
+            return
+        if not target:
+            self.ctx.logger.warning("hold_on 通知未配置有效目标")
+            return
+        try:
+            sent = await self.ctx.send.text(outbound, target)
+            if sent:
+                self.ctx.logger.info("hold_on 已转发停模通知 target=%s", target)
+            else:
+                self.ctx.logger.warning("hold_on 通知发送失败 target=%s", target)
+        except Exception as exc:
+            self.ctx.logger.error("hold_on 通知发送异常: %s", exc, exc_info=True)
 
     def _active_limit_specs(self) -> list[tuple[str, str]]:
         """返回当前生效限制目标列表：(scope, target)。target 为空表示该 scope 下各目标分别统计。"""
@@ -369,8 +583,15 @@ class HoldOnPlugin(MaiBotPlugin):
         lines = [
             f"【{start:%m-%d}: {start:%H:%M} ~ {end:%H:%M}】",
             f"状态：{'停止响应' if holding else '正常响应'}",
-            "统计：",
         ]
+        if holding:
+            hold = self.state.hold_info()
+            if hold.reason:
+                lines.append(f"原因：{hold.reason}")
+            rem = int(hold.remaining_seconds())
+            if rem > 0:
+                lines.append(f"剩余停止：{rem}s")
+        lines.append("统计：")
         feature_models = {
             str(f.feature): list(f.models or [])
             for f in (self.config.catalog.features or [])
@@ -409,19 +630,30 @@ class HoldOnPlugin(MaiBotPlugin):
     @HookHandler("chat.receive.after_process", name="hold_on_receive_abort", description="消耗达到限制时 LATE abort", mode=HookMode.BLOCKING, order=HookOrder.LATE)
     async def handle_receive_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
         del kwargs
-        if not self._active() or self._message_plain(message).startswith("/"): return {"action": "continue"}
+        if not self._active() or self._message_plain(message).startswith("/"):
+            return {"action": "continue"}
+        await self._maybe_reset_error_streak()
         decision = await self._check()
         if decision:
-            self.state.activate_hold(seconds=60, reason=decision.reason, rule_scope=decision.scope, rule_name=decision.target, error_type=decision.metric)
+            self.state.activate_hold(
+                seconds=60,
+                reason=decision.reason,
+                rule_scope=decision.scope,
+                rule_name=decision.target,
+                error_type=decision.metric,
+            )
         return {"action": "abort"} if self.state.is_holding() else {"action": "continue"}
+
     @staticmethod
     def _message_plain(message: Any) -> str:
         return str(message.get("processed_plain_text") or "") if isinstance(message, dict) else ""
+
     @Command("holdon_status", description="查看当前消耗与限制", pattern=r"/稍等\s*$")
     async def cmd_status(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
             return await self._send(stream_id, "权限不足。")
+        await self._maybe_reset_error_streak()
         now = datetime.now()
         if self.config.budget.enabled and self.config.budget.items:
             start = min(self._period(now, item)[0] for item in self.config.budget.items)
@@ -443,10 +675,15 @@ class HoldOnPlugin(MaiBotPlugin):
                 now=now,
             ),
         )
+
     @Command("holdon_clear", description="解除限制", pattern=r"/解除\s*$")
     async def cmd_clear(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
-        if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")): return await self._send(stream_id, "权限不足。")
-        self.state.clear_hold(); return await self._send(stream_id, "已解除。")
+        if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
+            return await self._send(stream_id, "权限不足。")
+        self.state.clear_hold()
+        return await self._send(stream_id, "已解除。")
 
-def create_plugin() -> HoldOnPlugin: return HoldOnPlugin()
+
+def create_plugin() -> HoldOnPlugin:
+    return HoldOnPlugin()

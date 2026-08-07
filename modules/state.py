@@ -67,6 +67,8 @@ class HoldOnState:
         self._max_events = max(500, int(max_events or 5000))
         self._hold = HoldInfo()
         self._model_provider: Dict[str, str] = {}
+        self._error_hold_streak: int = 0
+        self._hold_ended_ts: float = 0.0
         self.load()
 
     def load(self) -> None:
@@ -106,6 +108,8 @@ class HoldOnState:
                     for k, v in mapping.items()
                     if str(k).strip() and str(v).strip()
                 }
+            self._error_hold_streak = max(0, int(raw.get("error_hold_streak") or 0))
+            self._hold_ended_ts = float(raw.get("hold_ended_ts") or 0)
 
     def save(self) -> None:
         with self._lock:
@@ -121,6 +125,8 @@ class HoldOnState:
                     "activated_ts": self._hold.activated_ts,
                 },
                 "model_provider": dict(self._model_provider),
+                "error_hold_streak": int(self._error_hold_streak),
+                "hold_ended_ts": float(self._hold_ended_ts),
                 "saved_at": time.time(),
             }
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +230,7 @@ class HoldOnState:
         error_type: str = "",
         model: str = "",
         provider: str = "",
+        feature: str = "",
         models: Optional[List[str]] = None,
         now: Optional[float] = None,
     ) -> int:
@@ -233,13 +240,19 @@ class HoldOnState:
         model_set = {str(m).strip() for m in (models or []) if str(m).strip()}
         want_model = str(model or "").strip()
         want_provider = str(provider or "").strip()
+        want_feature = str(feature or "").strip()
         total = 0
         for event in events:
             if want_model and event.model != want_model:
                 continue
-            if model_set and event.model not in model_set:
-                continue
             if want_provider and event.provider != want_provider:
+                continue
+            if want_feature:
+                by_feature = event.feature == want_feature
+                by_model = bool(model_set) and event.model in model_set
+                if not by_feature and not by_model:
+                    continue
+            elif model_set and event.model not in model_set:
                 continue
             if not error_type_matches(error_type, event.error_type):
                 continue
@@ -251,6 +264,7 @@ class HoldOnState:
             if not self._hold.is_active(now):
                 if self._hold.until_ts:
                     self._hold = HoldInfo()
+                    self._hold_ended_ts = time.time() if now is None else float(now)
                     self.save()
                 return False
             return True
@@ -265,6 +279,36 @@ class HoldOnState:
                 error_type=self._hold.error_type,
                 activated_ts=self._hold.activated_ts,
             )
+
+    @property
+    def error_hold_streak(self) -> int:
+        with self._lock:
+            return int(self._error_hold_streak)
+
+    @property
+    def hold_ended_ts(self) -> float:
+        with self._lock:
+            return float(self._hold_ended_ts or 0)
+
+    def bump_error_hold_streak(self) -> int:
+        """新一次错误停模触发时 +1，返回当前档位（从 1 开始）。"""
+        with self._lock:
+            self._error_hold_streak = max(0, int(self._error_hold_streak)) + 1
+            self.save()
+            return int(self._error_hold_streak)
+
+    def reset_error_hold_streak(self) -> None:
+        with self._lock:
+            if self._error_hold_streak or self._hold_ended_ts:
+                self._error_hold_streak = 0
+                self._hold_ended_ts = 0.0
+                self.save()
+
+    def mark_hold_ended(self) -> None:
+        """解除或到期后保留 streak，等待成功调用再清零。"""
+        with self._lock:
+            self._hold_ended_ts = time.time()
+            self.save()
 
     def activate_hold(
         self,
@@ -300,8 +344,43 @@ class HoldOnState:
             had = self._hold.is_active() or bool(self._hold.until_ts)
             self._hold = HoldInfo()
             if had:
+                self._hold_ended_ts = time.time()
                 self.save()
             return had
+
+    def error_type_distribution(
+        self,
+        *,
+        scope: str,
+        target: str,
+        window_seconds: float,
+        feature_models: Optional[Dict[str, List[str]]] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, int]:
+        from .error_classify import error_type_matches
+
+        events = self.events_since(window_seconds, now=now)
+        want = str(target or "").strip()
+        scope_key = str(scope or "").strip().lower()
+        models = {
+            str(m).strip()
+            for m in ((feature_models or {}).get(want) or [])
+            if str(m).strip()
+        }
+        dist: Dict[str, int] = {}
+        for event in events:
+            matched = False
+            if scope_key == "provider" and event.provider == want:
+                matched = True
+            elif scope_key == "model" and event.model == want:
+                matched = True
+            elif scope_key == "feature":
+                matched = event.feature == want or (bool(models) and event.model in models)
+            if not matched:
+                continue
+            key = str(event.error_type or "other").strip() or "other"
+            dist[key] = int(dist.get(key) or 0) + 1
+        return dist
 
     def snapshot(
         self,

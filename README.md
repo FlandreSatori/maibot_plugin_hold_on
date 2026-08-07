@@ -13,6 +13,7 @@
 - `strict`：按计划曲线超速立即停止。
 - `balanced`：允许有限透支，透支后等待追回。
 - `lenient`：允许更大的自定义透支比例。
+- `error_rules`：指定窗口内错误次数达限后停止入站。第一次停 `hold_seconds`；若解除/到期后仍无成功调用又再次达限，则按 2x、3x… 线性增长，上限 `hold_max_seconds`。
 - Token 指标使用 `input_tokens * input_weight + output_tokens * output_weight`。
 
 ## 命令

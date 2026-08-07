@@ -1,8 +1,8 @@
-"""错误阈值规则 → 停模。"""
+"""错误阈值规则 → 停模（连续触发线性增长停止时长）。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .error_classify import classify_error, error_type_matches
@@ -23,6 +23,7 @@ class ThresholdRule:
     window_seconds: int = 60
     threshold: int = 5
     hold_seconds: int = 90
+    hold_max_seconds: int = 3600
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,16 @@ class HoldEvent:
     count: int = 0
     threshold: int = 0
     window_seconds: int = 0
+    hold_seconds: int = 0
+    streak: int = 1
+    distribution: Dict[str, int] = field(default_factory=dict)
+
+
+SCOPE_LABELS = {
+    "feature": "功能",
+    "model": "模型",
+    "provider": "厂商",
+}
 
 
 class HoldOnPolicy:
@@ -60,17 +71,20 @@ class HoldOnPolicy:
             return ""
         return self.model_providers.get(name) or self.state.provider_of(name)
 
-    def features_of(self, model_name: str) -> List[str]:
+    def features_of(self, model_name: str, feature: str = "") -> List[str]:
         name = str(model_name or "").strip()
-        if not name:
-            return []
-        return [feat for feat, models in self.features.items() if name in models]
+        found = [feat for feat, models in self.features.items() if name and name in models]
+        feat = str(feature or "").strip()
+        if feat and feat not in found:
+            found.append(feat)
+        return found
 
     def on_error(
         self,
         *,
         model_name: str,
         provider: str = "",
+        feature: str = "",
         message: str = "",
         error_type: str = "",
         error: Optional[dict] = None,
@@ -79,38 +93,98 @@ class HoldOnPolicy:
         if not model:
             return None
         prov = str(provider or "").strip() or self.provider_of(model)
+        feat = str(feature or "").strip()
         etype = str(error_type or "").strip() or classify_error(message, error=error)
         self.state.record_error(
             model=model,
             provider=prov,
+            feature=feat,
             error_type=etype,
             message=message,
         )
-        return self._evaluate_rules(model=model, provider=prov, error_type=etype)
+        return self._evaluate_rules(
+            model=model,
+            provider=prov,
+            feature=feat,
+            error_type=etype,
+        )
+
+    @staticmethod
+    def scope_label(scope: str) -> str:
+        key = str(scope or "").strip().lower()
+        return SCOPE_LABELS.get(key, key or "目标")
+
+    @staticmethod
+    def linear_hold_seconds(rule: ThresholdRule, streak: int) -> int:
+        """第 N 次连续触发（中间无成功调用）= N × base，并封顶。"""
+
+        base = max(1, int(rule.hold_seconds or 90))
+        multiplier = max(1, int(streak or 1))
+        seconds = base * multiplier
+        cap = max(base, int(rule.hold_max_seconds or 3600))
+        return min(cap, seconds)
 
     def _evaluate_rules(
-        self, *, model: str, provider: str, error_type: str
+        self,
+        *,
+        model: str,
+        provider: str,
+        feature: str,
+        error_type: str,
     ) -> Optional[HoldEvent]:
         triggered: Optional[HoldEvent] = None
         for rule in self.rules:
-            hit = self._rule_hit_count(rule, model=model, provider=provider, error_type=error_type)
+            hit = self._rule_hit_count(
+                rule,
+                model=model,
+                provider=provider,
+                feature=feature,
+                error_type=error_type,
+            )
             if hit is None:
                 continue
             target_name, count = hit
             if count < int(rule.threshold):
                 continue
+
+            was_holding = self.state.is_holding()
+            if was_holding:
+                # 已在停止中：只延长到当前档位时长，不重复加档、不重复通知
+                streak = max(1, self.state.error_hold_streak)
+                hold_seconds = self.linear_hold_seconds(rule, streak)
+                reason = (
+                    f"{self.scope_label(rule.scope)}:{target_name or '*'} "
+                    f"在 {rule.window_seconds}s 内达到 {count}/{rule.threshold}"
+                )
+                self.state.activate_hold(
+                    seconds=float(hold_seconds),
+                    reason=reason,
+                    rule_scope=rule.scope,
+                    rule_name=target_name,
+                    error_type=rule.error_type or error_type,
+                )
+                continue
+
+            streak = self.state.bump_error_hold_streak()
+            hold_seconds = self.linear_hold_seconds(rule, streak)
             reason = (
-                f"{rule.scope}:{target_name or '*'} 类型 {rule.error_type or '*'} "
+                f"{self.scope_label(rule.scope)}:{target_name or '*'} "
                 f"在 {rule.window_seconds}s 内达到 {count}/{rule.threshold}"
             )
             newly = self.state.activate_hold(
-                seconds=float(rule.hold_seconds or 90),
+                seconds=float(hold_seconds),
                 reason=reason,
                 rule_scope=rule.scope,
                 rule_name=target_name,
                 error_type=rule.error_type or error_type,
             )
             if newly and triggered is None:
+                dist = self.state.error_type_distribution(
+                    scope=rule.scope,
+                    target=target_name,
+                    window_seconds=float(rule.window_seconds),
+                    feature_models={k: list(v) for k, v in self.features.items()},
+                )
                 triggered = HoldEvent(
                     reason=reason,
                     scope=rule.scope,
@@ -119,6 +193,9 @@ class HoldOnPolicy:
                     count=count,
                     threshold=int(rule.threshold),
                     window_seconds=int(rule.window_seconds),
+                    hold_seconds=hold_seconds,
+                    streak=streak,
+                    distribution=dist,
                 )
         return triggered
 
@@ -128,6 +205,7 @@ class HoldOnPolicy:
         *,
         model: str,
         provider: str,
+        feature: str,
         error_type: str,
     ) -> Optional[Tuple[str, int]]:
         if not error_type_matches(rule.error_type, error_type):
@@ -162,24 +240,23 @@ class HoldOnPolicy:
             return target, count
 
         if scope == "feature":
-            feats = self.features_of(model)
-            if not feats:
-                return None
+            feats = self.features_of(model, feature=feature)
             if want_name:
-                if want_name not in feats:
+                if want_name not in feats and want_name != feature:
                     return None
                 feat_names = [want_name]
             else:
-                feat_names = feats
+                feat_names = feats or ([feature] if feature else [])
+            if not feat_names:
+                return None
             best: Optional[Tuple[str, int]] = None
             for feat in feat_names:
                 models = list(self.features.get(feat) or ())
-                if not models:
-                    continue
                 count = self.state.count_errors(
                     window_seconds=window,
                     error_type=rule.error_type,
-                    models=models,
+                    models=models or None,
+                    feature=feat,
                 )
                 if best is None or count > best[1]:
                     best = (feat, count)
@@ -190,43 +267,12 @@ class HoldOnPolicy:
     def is_holding(self) -> bool:
         return self.state.is_holding()
 
-    def status_text(self, host_success: Dict[str, Dict]) -> str:
-        snap = self.state.snapshot(
-            stats_window=float(self.stats_window_seconds),
-            host_success=host_success,
-        )
-        lines = ["【稍等状态】"]
-        if snap["holding"]:
-            hold = snap["hold"]
-            lines.append(f"停模中: 是（剩余 {int(hold['remaining'])}s）")
-            if hold.get("reason"):
-                lines.append(f"原因: {hold['reason']}")
-        else:
-            lines.append("停模中: 否")
-
-        lines.append(f"统计窗口: {int(snap['stats_window'])}s")
-        models = snap.get("models") or []
-        if not models:
-            lines.append("暂无模型调用统计。")
-            return "\n".join(lines)
-
-        lines.append("模型出错率:")
-        for item in models:
-            ok = int(item.get("success") or 0)
-            err = int(item.get("error") or 0)
-            rate = float(item.get("error_rate") or 0.0)
-            provider = str(item.get("provider") or "")
-            label = str(item.get("model") or "")
-            if provider:
-                label = f"{label} ({provider})"
-            lines.append(f"- {label}: 成功 {ok} / 失败 {err}  出错率 {rate:.1f}%")
-            by_type = item.get("by_type") or {}
-            if by_type:
-                parts = [f"{k}×{v}" for k, v in sorted(by_type.items(), key=lambda x: (-x[1], x[0]))]
-                lines.append(f"  类型: {', '.join(parts)}")
-            for reason in (item.get("recent_reasons") or [])[:3]:
-                short = " ".join(str(reason).split())
-                if len(short) > 120:
-                    short = short[:120] + "…"
-                lines.append(f"  · {short}")
-        return "\n".join(lines)
+    @staticmethod
+    def format_distribution(distribution: Dict[str, int]) -> str:
+        if not distribution:
+            return "无详细错误分布"
+        parts = [
+            f"{name} x{count}"
+            for name, count in sorted(distribution.items(), key=lambda x: (-x[1], x[0]))
+        ]
+        return "，".join(parts)
