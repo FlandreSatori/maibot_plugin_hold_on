@@ -1,4 +1,4 @@
 {
   "plugin.name": "稍，稍等一下！",
-  "plugin.description": "统计模型出错率与报错原因；按模型/厂商/功能错误阈值在 LATE 阶段 abort"
+  "plugin.description": "为 模型/厂商/功能 提供RPM，智能限速"
 }

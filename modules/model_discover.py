@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
+from typing import List, Optional, Sequence
 
 
 @dataclass
@@ -120,82 +116,3 @@ def discover_models(extra_paths: Sequence[str] | None = None) -> Optional[Discov
         return discover_from_toml(path)
     except Exception:
         return None
-
-
-def discovery_to_config_sections(result: DiscoveryResult) -> Dict[str, Any]:
-    """转为 catalog：模型↔厂商 + 功能→模型列表。"""
-
-    return {
-        "catalog": {
-            "models": [
-                {"name": m.name, "provider": m.provider} for m in result.models if m.name
-            ],
-            "features": [
-                {"feature": f.feature, "models": list(f.models)} for f in result.features
-            ],
-        },
-    }
-
-
-def write_simple_toml(path: Path, data: Dict[str, Any]) -> None:
-    """写入本插件够用的 TOML（不依赖 tomlkit）。"""
-
-    lines: List[str] = []
-
-    def emit_value(value: Any) -> str:
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, int):
-            return str(value)
-        if isinstance(value, float):
-            return str(value)
-        if isinstance(value, list):
-            inner = ", ".join(emit_value(v) for v in value)
-            return f"[{inner}]"
-        text = str(value).replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{text}"'
-
-    def emit_table(prefix: str, table: Dict[str, Any]) -> None:
-        scalars = {k: v for k, v in table.items() if not isinstance(v, (dict, list))}
-        list_of_tables = {
-            k: v
-            for k, v in table.items()
-            if isinstance(v, list) and v and all(isinstance(i, dict) for i in v)
-        }
-        nested = {k: v for k, v in table.items() if isinstance(v, dict)}
-        plain_lists = {
-            k: v
-            for k, v in table.items()
-            if isinstance(v, list) and k not in list_of_tables
-        }
-
-        if prefix:
-            lines.append(f"[{prefix}]")
-        for key, value in scalars.items():
-            lines.append(f"{key} = {emit_value(value)}")
-        for key, value in plain_lists.items():
-            lines.append(f"{key} = {emit_value(value)}")
-        if scalars or plain_lists:
-            lines.append("")
-
-        for key, items in list_of_tables.items():
-            array_prefix = f"{prefix}.{key}" if prefix else key
-            for item in items:
-                lines.append(f"[[{array_prefix}]]")
-                for ik, iv in item.items():
-                    lines.append(f"{ik} = {emit_value(iv)}")
-                lines.append("")
-
-        for key, child in nested.items():
-            child_prefix = f"{prefix}.{key}" if prefix else key
-            emit_table(child_prefix, child)
-
-    for key, value in data.items():
-        if isinstance(value, dict):
-            emit_table(key, value)
-        else:
-            lines.append(f"{key} = {emit_value(value)}")
-            lines.append("")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
