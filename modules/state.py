@@ -225,6 +225,44 @@ class HoldOnState:
         with self._lock:
             return [e for e in self._events if start <= e.ts <= end]
 
+    def latest_error_for_specs(
+        self,
+        *,
+        specs: list[tuple[str, str]],
+        feature_models: Optional[Dict[str, List[str]]] = None,
+        start_ts: float = 0.0,
+        end_ts: Optional[float] = None,
+    ) -> Optional[StatEvent]:
+        """最近一条命中监听目标的错误事件。"""
+
+        end = time.time() if end_ts is None else float(end_ts)
+        start = float(start_ts or 0)
+        normalized = [(str(scope or "").strip().lower(), str(target or "").strip()) for scope, target in specs]
+        if not normalized:
+            return None
+        feature_map = feature_models or {}
+        latest: Optional[StatEvent] = None
+        with self._lock:
+            for event in reversed(self._events):
+                if event.ts < start or event.ts > end:
+                    continue
+                for scope, target in normalized:
+                    matched = False
+                    if scope == "provider":
+                        matched = (not target) or event.provider == target
+                    elif scope == "model":
+                        matched = (not target) or event.model == target
+                    elif scope == "feature":
+                        models = {
+                            str(m).strip()
+                            for m in (feature_map.get(target) or [])
+                            if str(m).strip()
+                        } if target else set()
+                        matched = (not target) or event.feature == target or (bool(models) and event.model in models)
+                    if matched:
+                        return event
+        return latest
+
     def count_errors_for_scope(
         self,
         *,

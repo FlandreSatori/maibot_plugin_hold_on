@@ -17,8 +17,8 @@ from .modules.controller import (
 from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
 from .modules.model_discover import discover_models
 from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
-from .modules.state import HoldOnState
 from .modules.usage_sync import aggregate_usage
+from .modules.state import HoldOnState, StatEvent
 
 class PluginConfig(PluginConfigBase):
     __ui_label__ = "插件"
@@ -593,19 +593,119 @@ class HoldOnPlugin(MaiBotPlugin):
             )
         return None
 
+    def _monitored_specs(self) -> list[tuple[str, str]]:
+        """速率限制 + 错误阈值的监听目标。"""
+        specs: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for scope, target in self._active_limit_specs():
+            key = (str(scope), str(target or "").strip())
+            if key not in seen:
+                seen.add(key)
+                specs.append(key)
+        if self.config.error_rules.enabled:
+            for item in self.config.error_rules.items or []:
+                key = (str(item.scope or "feature"), str(item.name or "").strip())
+                if key not in seen:
+                    seen.add(key)
+                    specs.append(key)
+        return specs
+
+    def _matches_monitored(
+        self,
+        *,
+        provider: str = "",
+        model: str = "",
+        feature: str = "",
+        specs: list[tuple[str, str]],
+        feature_models: Dict[str, list[str]],
+    ) -> bool:
+        for scope, target in specs:
+            scope_key = str(scope or "").strip().lower()
+            want = str(target or "").strip()
+            if scope_key == "provider":
+                if (not want and provider) or provider == want:
+                    return True
+            elif scope_key == "model":
+                if (not want and model) or model == want:
+                    return True
+            elif scope_key == "feature":
+                models = {str(m).strip() for m in (feature_models.get(want) or []) if str(m).strip()} if want else set()
+                if (not want and feature) or feature == want or (bool(models) and model in models):
+                    return True
+        return False
+
+    def _latest_success_for_specs(
+        self,
+        metrics: Dict[str, Any],
+        *,
+        specs: list[tuple[str, str]],
+        feature_models: Dict[str, list[str]],
+    ) -> Optional[Dict[str, Any]]:
+        for row in metrics.get("window_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if self._matches_monitored(
+                provider=str(row.get("provider") or ""),
+                model=str(row.get("model") or ""),
+                feature=str(row.get("feature") or ""),
+                specs=specs,
+                feature_models=feature_models,
+            ):
+                return row
+        return None
+
+    @staticmethod
+    def _format_tokens_m(tokens: float) -> str:
+        return f"{float(tokens) / 1_000_000:.3f}M"
+
+    @staticmethod
+    def _format_cost_per_hour(cost: float, elapsed_seconds: float) -> str:
+        hours = max(float(elapsed_seconds), 1.0) / 3600.0
+        return f"{float(cost) / hours:.4f}¥/小时"
+
+    @staticmethod
+    def _format_event_time(ts: float) -> str:
+        if ts <= 0:
+            return "--:--"
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+    def _format_success_detail(self, row: Dict[str, Any]) -> str:
+        return (
+            f"最近成功：{self._format_event_time(float(row.get('ts') or 0))} "
+            f"{row.get('feature') or '-'} / {row.get('model') or '-'} "
+            f"token {int(row.get('tokens') or 0)} "
+            f"成本 {float(row.get('cost') or 0):.5f}¥ "
+            f"耗时 {float(row.get('time_cost') or 0):.2f}s"
+        )
+
+    def _format_error_detail(self, event: StatEvent) -> str:
+        msg = str(event.message or "").strip()
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        suffix = f" | {msg}" if msg else ""
+        return (
+            f"最近错误：{self._format_event_time(event.ts)} "
+            f"{event.feature or '-'} / {event.model or '-'} "
+            f"{event.error_type or 'other'}{suffix}"
+        )
+
     @staticmethod
     def _format_amount(value: float, metric: str) -> str:
         if metric == "cost":
-            return f"{value:.5f}"
+            return f"{value:.4f}¥"
         if metric == "requests":
             return f"{int(value)}"
+        if metric == "tokens":
+            return f"{float(value) / 1_000_000:.3f}M"
         return f"{value:.0f}"
 
     @staticmethod
     def _format_rate(value: float, metric: str) -> str:
-        unit = {"cost": "成本/秒", "tokens": "token/秒", "requests": "次/秒"}.get(metric, "/秒")
         if metric == "cost":
-            return f"{value:.5f}{unit}"
+            return f"{float(value) * 3600:.4f}¥/小时"
+        if metric == "tokens":
+            return f"{float(value) * 3600 / 1_000_000:.3f}M/小时"
+        unit = {"requests": "次/秒"}.get(metric, "/秒")
         if value >= 10:
             return f"{value:.1f}{unit}"
         return f"{value:.2f}{unit}"
@@ -651,6 +751,7 @@ class HoldOnPlugin(MaiBotPlugin):
         now: Optional[datetime] = None,
     ) -> str:
         now = now or end
+        elapsed = max(1.0, (now - start).total_seconds())
         lines = [
             f"【{start:%m-%d}: {start:%H:%M} ~ {end:%H:%M}】",
             f"状态：{'停止响应' if holding else '正常响应'}",
@@ -664,12 +765,34 @@ class HoldOnPlugin(MaiBotPlugin):
                 lines.append(f"剩余停止：{rem}s")
         rate_hits = self.state.count_rate_limits(start_ts=start.timestamp(), end_ts=end.timestamp())
         lines.append(f"限速触发：{rate_hits} 次")
-        lines.append("统计：")
-        feature_models = {
+
+        catalog_features = {
             str(f.feature): list(f.models or [])
             for f in (self.config.catalog.features or [])
             if str(f.feature or "").strip()
         }
+        discovered = (self._catalog or {}).get("features") or {}
+        feature_models = {**{str(k): list(v or []) for k, v in discovered.items()}, **catalog_features}
+        monitored = self._monitored_specs()
+        latest_ok = self._latest_success_for_specs(
+            metrics, specs=monitored, feature_models=feature_models
+        )
+        latest_err = self.state.latest_error_for_specs(
+            specs=monitored,
+            feature_models=feature_models,
+            start_ts=start.timestamp(),
+            end_ts=end.timestamp(),
+        )
+        if latest_ok:
+            lines.append(self._format_success_detail(latest_ok))
+        else:
+            lines.append("最近成功：（监听目标暂无成功记录）")
+        if latest_err:
+            lines.append(self._format_error_detail(latest_err))
+        else:
+            lines.append("最近错误：（监听目标暂无错误记录）")
+
+        lines.append("统计：")
         groups = list(metrics.get("groups") or [])
         targets = self._status_targets(metrics)
         if not targets:
@@ -694,7 +817,8 @@ class HoldOnPlugin(MaiBotPlugin):
             suffix = self._rate_suffix(scope=scope, target=target, groups=groups, now=now)
             lines.append(
                 f"- {target}: 成功 {int(success['requests'])} / 失败 {fails} ，"
-                f"限速 {hits} ，token {int(success['tokens'])} ，成本 {success['cost']:.5f}"
+                f"限速 {hits} ，token {self._format_tokens_m(success['tokens'])} ，"
+                f"成本 {self._format_cost_per_hour(success['cost'], elapsed)}"
                 f"{suffix}"
             )
         return "\n".join(lines)
