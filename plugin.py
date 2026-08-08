@@ -673,7 +673,9 @@ class HoldOnPlugin(MaiBotPlugin):
         return (
             f"最近成功：{self._format_event_time(float(row.get('ts') or 0))} "
             f"{row.get('feature') or '-'} / {row.get('model') or '-'} "
-            f"token {int(row.get('tokens') or 0)} "
+            f"输入 {int(row.get('input_tokens') or 0)} "
+            f"输出 {int(row.get('output_tokens') or 0)} "
+            f"缓存命中 {int(row.get('cache_hit_tokens') or 0)} "
             f"成本 {float(row.get('cost') or 0):.5f}¥ "
             f"耗时 {float(row.get('time_cost') or 0):.2f}s"
         )

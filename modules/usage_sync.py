@@ -57,6 +57,8 @@ def usage_row_view(row: Dict[str, Any]) -> Dict[str, Any]:
     input_tokens = int(row.get("prompt_tokens") or 0)
     output_tokens = int(row.get("completion_tokens") or 0)
     tokens = int(row.get("total_tokens") or (input_tokens + output_tokens))
+    cache_hit = int(row.get("prompt_cache_hit_tokens") or 0)
+    cache_miss = int(row.get("prompt_cache_miss_tokens") or 0)
     return {
         "ts": float(ts or 0),
         "provider": str(row.get("model_api_provider_name") or "").strip(),
@@ -66,6 +68,9 @@ def usage_row_view(row: Dict[str, Any]) -> Dict[str, Any]:
         "tokens": tokens,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_hit_tokens": cache_hit,
+        "cache_miss_tokens": cache_miss,
+        "cache_enabled": bool(row.get("prompt_cache_enabled")),
         "cost": float(row.get("cost") or 0.0),
         "time_cost": float(row.get("time_cost") or 0.0),
         "raw": row,
