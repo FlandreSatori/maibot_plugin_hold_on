@@ -5,20 +5,38 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
-from .modules.controller import (
-    BudgetRule,
-    Decision,
-    LimitRule,
-    budget_progress,
-    check_budget,
-    check_static,
-    static_progress,
-)
-from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
-from .modules.model_discover import discover_models
-from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
-from .modules.usage_sync import aggregate_usage
-from .modules.state import HoldOnState, StatEvent
+try:
+    from .modules.controller import (
+        BudgetRule,
+        Decision,
+        LimitRule,
+        budget_progress,
+        check_budget,
+        check_static,
+        static_progress,
+    )
+    from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
+    from .modules.model_discover import discover_models
+    from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
+    from .modules.usage_sync import aggregate_usage
+    from .modules.state import HoldOnState, StatEvent
+    from .modules.forward_guard import count_images_in_message, should_abort_for_forward_images
+except ImportError:  # pragma: no cover - 兼容直接脚本导入
+    from modules.controller import (
+        BudgetRule,
+        Decision,
+        LimitRule,
+        budget_progress,
+        check_budget,
+        check_static,
+        static_progress,
+    )
+    from modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
+    from modules.model_discover import discover_models
+    from modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
+    from modules.usage_sync import aggregate_usage
+    from modules.state import HoldOnState, StatEvent
+    from modules.forward_guard import count_images_in_message, should_abort_for_forward_images
 
 class PluginConfig(PluginConfigBase):
     __ui_label__ = "插件"
@@ -28,6 +46,7 @@ class PluginConfig(PluginConfigBase):
     config_version: str = Field(default="3.0.0", description="配置版本")
     auto_detect_models: bool = Field(default=True, description="自动同步模型、厂商和功能")
     model_config_path: str = Field(default="", description="宿主 model_config.toml 路径，留空自动查找")
+    forward_image_threshold: int = Field(default=0, ge=0, description="合并转发消息图片数达到该值时阻止入站；0 表示禁用")
 
 class StatsConfig(PluginConfigBase):
     __ui_label__ = "统计"
@@ -242,6 +261,22 @@ class HoldOnPlugin(MaiBotPlugin):
 
     def _active(self) -> bool:
         return bool(self.config.plugin.enabled)
+
+    def _should_abort_forward_images(self, message: Any) -> bool:
+        threshold = int(getattr(self.config.plugin, "forward_image_threshold", 0) or 0)
+        if threshold <= 0:
+            return False
+        if not should_abort_for_forward_images(message, threshold=threshold):
+            return False
+        logger = getattr(getattr(self, "ctx", None), "logger", None)
+        if logger is not None:
+            logger.info(
+                "hold_on 阻止合并转发消息: images=%d threshold=%d",
+                count_images_in_message(message),
+                threshold,
+            )
+        return True
+
     async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
         return await aggregate_usage(
             self.ctx,
@@ -837,6 +872,8 @@ class HoldOnPlugin(MaiBotPlugin):
         del kwargs
         if not self._active() or self._message_plain(message).startswith("/"):
             return {"action": "continue"}
+        if self._should_abort_forward_images(message):
+            return {"action": "abort"}
         await self._maybe_reset_error_streak()
         decision = await self._check()
         if decision:
