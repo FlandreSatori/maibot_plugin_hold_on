@@ -49,7 +49,46 @@ def count_images_in_message(message: Any) -> int:
     raw_message = message.get("raw_message")
     if not isinstance(raw_message, list):
         return 0
-    return sum(1 for seg in raw_message if _is_image_segment(seg))
+    def _count_in_seg(seg: Any) -> int:
+        # direct image segment
+        if _is_image_segment(seg):
+            return 1
+        # forward segment: try to inspect nested nodes
+        if _is_forward_segment(seg):
+            data = seg.get("data")
+            total = 0
+            # list of nodes
+            if isinstance(data, list):
+                for node in data:
+                    if not isinstance(node, dict):
+                        continue
+                    # node may wrap a message or raw_message
+                    nested_raw = node.get("raw_message") or node.get("message") or node.get("data")
+                    if isinstance(nested_raw, dict):
+                        nested_raw = nested_raw.get("raw_message") or nested_raw.get("message") or nested_raw
+                    if isinstance(nested_raw, list):
+                        for nseg in nested_raw:
+                            total += _count_in_seg(nseg)
+                        continue
+                    # node itself might be an image segment
+                    if _is_image_segment(node):
+                        total += 1
+                return total
+            # dict-like forward data
+            if isinstance(data, dict):
+                # try common nested keys
+                nested = data.get("raw_message") or data.get("message") or data.get("data")
+                if isinstance(nested, list):
+                    for nseg in nested:
+                        total += _count_in_seg(nseg)
+                else:
+                    # if data itself looks like an image segment
+                    if _is_image_segment(data):
+                        total += 1
+                return total
+        return 0
+
+    return sum(_count_in_seg(seg) for seg in raw_message)
 
 
 def should_abort_for_forward_images(message: Any, *, threshold: int = 0) -> bool:
