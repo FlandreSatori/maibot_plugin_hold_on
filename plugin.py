@@ -722,10 +722,21 @@ class HoldOnPlugin(MaiBotPlugin):
         )
 
     @staticmethod
-    def _format_progress_bar(actual: float, total: float, width: int = 12) -> str:
+    def _format_progress_bar(actual: float, total: float, metric: str, width: int = 12) -> str:
         ratio = max(0.0, min(1.0, actual / total if total > 0 else 0.0))
         filled = min(width, int(round(ratio * width)))
-        return f"{'█' * filled}{'░' * (width - filled)} {ratio:.0%}"
+        if metric == "cost":
+            format_value = lambda value: f"{value:.4f}¥"
+        elif metric == "tokens":
+            format_value = lambda value: f"{value / 1_000_000:.3f}M"
+        elif metric == "requests":
+            format_value = lambda value: f"{int(value)}"
+        else:
+            format_value = lambda value: f"{value:.0f}"
+        return (
+            f"{'█' * filled}{'░' * (width - filled)} "
+            f"{format_value(actual)} / {format_value(total)}"
+        )
 
     @staticmethod
     def _format_rate(value: float, metric: str) -> str:
@@ -752,7 +763,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 return ""
             progress = budget_progress(groups, rule, now)
             return (
-                f"{self._format_progress_bar(progress['actual'], rule.amount)}\n"
+                f"{self._format_progress_bar(progress['actual'], rule.amount, rule.metric)}\n"
                 f"\n实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
                 f"\n计划速度 {self._format_rate(progress['recover_speed'], rule.metric)}"
             )
@@ -762,7 +773,7 @@ class HoldOnPlugin(MaiBotPlugin):
             return ""
         progress = static_progress(groups, rule)
         return (
-            f"{self._format_progress_bar(progress['actual'], rule.limit)}\n"
+            f"{self._format_progress_bar(progress['actual'], rule.limit, rule.metric)}\n"
             f"\n实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
             f"\n限额速度 {self._format_rate(progress['plan_speed'], rule.metric)}"
         )
@@ -778,7 +789,6 @@ class HoldOnPlugin(MaiBotPlugin):
     ) -> str:
         now = now or end
         lines = [
-            "【消耗监控】",
             f"【时间】{start:%m-%d} {start:%H:%M} ~ {end:%H:%M}",
             f"【状态】{'停止响应' if holding else '正常响应'}",
         ]
