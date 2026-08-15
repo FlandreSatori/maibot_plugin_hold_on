@@ -737,6 +737,12 @@ class HoldOnPlugin(MaiBotPlugin):
         return f"{value:.0f}"
 
     @staticmethod
+    def _format_progress_bar(actual: float, total: float, width: int = 12) -> str:
+        ratio = max(0.0, min(1.0, actual / total if total > 0 else 0.0))
+        filled = min(width, int(round(ratio * width)))
+        return f"{'█' * filled}{'░' * (width - filled)} {ratio:.0%}"
+
+    @staticmethod
     def _format_rate(value: float, metric: str) -> str:
         if metric == "cost":
             return f"{float(value) * 3600:.4f}¥/小时"
@@ -790,18 +796,17 @@ class HoldOnPlugin(MaiBotPlugin):
         now = now or end
         elapsed = max(1.0, (now - start).total_seconds())
         lines = [
-            f"【{start:%m-%d}: {start:%H:%M} ~ {end:%H:%M}】",
-            f"状态：{'停止响应' if holding else '正常响应'}",
+            "【消耗监控】",
+            f"【时间】{start:%m-%d} {start:%H:%M} ~ {end:%H:%M}",
+            f"【状态】{'停止响应' if holding else '正常响应'}",
         ]
         if holding:
             hold = self.state.hold_info()
             if hold.reason:
-                lines.append(f"原因：{hold.reason}")
+                lines.append(f"【原因】{hold.reason}")
             rem = int(hold.remaining_seconds())
             if rem > 0:
-                lines.append(f"剩余停止：{rem}s")
-        rate_hits = self.state.count_rate_limits(start_ts=start.timestamp(), end_ts=end.timestamp())
-        lines.append(f"限速触发：{rate_hits} 次")
+                lines.append(f"【剩余停止】{rem}s")
 
         catalog_features = {
             str(f.feature): list(f.models or [])
@@ -821,21 +826,23 @@ class HoldOnPlugin(MaiBotPlugin):
             end_ts=end.timestamp(),
         )
         if latest_ok:
-            lines.append(self._format_success_detail(latest_ok))
+            lines.append(f"【最近成功】{self._format_success_detail(latest_ok)[5:]}")
         else:
-            lines.append("最近成功：（监听目标暂无成功记录）")
+            lines.append("【最近成功】监听目标暂无成功记录")
         if latest_err:
-            lines.append(self._format_error_detail(latest_err))
+            lines.append(f"【最近错误】{self._format_error_detail(latest_err)[5:]}")
         else:
-            lines.append("最近错误：（监听目标暂无错误记录）")
+            lines.append("【最近错误】监听目标暂无错误记录")
 
-        lines.append("统计：")
+        lines.append("")
+        lines.append("【额度使用】")
         groups = list(metrics.get("groups") or [])
         targets = self._status_targets(metrics)
         if not targets:
-            lines.append("- （当前没有生效的速率限制目标）")
+            lines.append("当前没有生效的速率限制目标")
             return "\n".join(lines)
 
+        target_lines: list[str] = []
         for scope, target in targets:
             success = self._sum_scope_metrics(groups, scope, target)
             fails = self.state.count_errors_for_scope(
@@ -852,12 +859,33 @@ class HoldOnPlugin(MaiBotPlugin):
                 target=target,
             )
             suffix = self._rate_suffix(scope=scope, target=target, groups=groups, now=now)
-            lines.append(
-                f"- {target}: 成功 {int(success['requests'])} / 失败 {fails} ，"
-                f"限速 {hits} ，token {self._format_tokens_m(success['tokens'])} ，"
+            target_lines.append(f"【{scope}:{target or '*'}】")
+            if self.config.budget.enabled and self.config.budget.items:
+                rule = self._find_budget_rule(scope, target, now)
+                if rule is not None:
+                    progress = budget_progress(groups, rule, now)
+                    target_lines.append(
+                        f"额度 {self._format_progress_bar(progress['actual'], rule.amount)} "
+                        f"{self._format_amount(progress['actual'], rule.metric)} / "
+                        f"{self._format_amount(rule.amount, rule.metric)}"
+                    )
+            else:
+                rule = self._find_static_rule(scope, target)
+                if rule is not None:
+                    progress = static_progress(groups, rule)
+                    target_lines.append(
+                        f"额度 {self._format_progress_bar(progress['actual'], rule.limit)} "
+                        f"{self._format_amount(progress['actual'], rule.metric)} / "
+                        f"{self._format_amount(rule.limit, rule.metric)}"
+                    )
+            target_lines.append(
+                f"统计 成功 {int(success['requests'])} / 失败 {fails} / 限速 {hits}，"
+                f"token {self._format_tokens_m(success['tokens'])}，"
                 f"成本 {self._format_cost_per_hour(success['cost'], elapsed)}"
                 f"{suffix}"
             )
+            target_lines.append("")
+        lines.extend(target_lines[:-1])
         return "\n".join(lines)
 
     async def _is_admin(self, platform: str, user_id: str) -> bool:
