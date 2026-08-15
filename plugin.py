@@ -694,11 +694,6 @@ class HoldOnPlugin(MaiBotPlugin):
         return f"{float(tokens) / 1_000_000:.3f}M"
 
     @staticmethod
-    def _format_cost_per_hour(cost: float, elapsed_seconds: float) -> str:
-        hours = max(float(elapsed_seconds), 1.0) / 3600.0
-        return f"{float(cost) / hours:.4f}¥/小时"
-
-    @staticmethod
     def _format_event_time(ts: float) -> str:
         if ts <= 0:
             return "--:--"
@@ -725,16 +720,6 @@ class HoldOnPlugin(MaiBotPlugin):
             f"{event.feature or '-'} / {event.model or '-'} "
             f"{event.error_type or 'other'}{suffix}"
         )
-
-    @staticmethod
-    def _format_amount(value: float, metric: str) -> str:
-        if metric == "cost":
-            return f"{value:.4f}¥"
-        if metric == "requests":
-            return f"{int(value)}"
-        if metric == "tokens":
-            return f"{float(value) / 1_000_000:.3f}M"
-        return f"{value:.0f}"
 
     @staticmethod
     def _format_progress_bar(actual: float, total: float, width: int = 12) -> str:
@@ -766,22 +751,20 @@ class HoldOnPlugin(MaiBotPlugin):
             if rule is None:
                 return ""
             progress = budget_progress(groups, rule, now)
-            remain_label = "成本" if rule.metric == "cost" else "token"
             return (
-                f" ，剩余{remain_label} {self._format_amount(progress['remaining'], rule.metric)}"
-                f" ，实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
-                f" ，计划速度 {self._format_rate(progress['recover_speed'], rule.metric)}"
+                f"{self._format_progress_bar(progress['actual'], rule.amount)}\n"
+                f"\n实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
+                f"\n计划速度 {self._format_rate(progress['recover_speed'], rule.metric)}"
             )
 
         rule = self._find_static_rule(scope, target)
         if rule is None:
             return ""
         progress = static_progress(groups, rule)
-        remain_label = {"cost": "成本", "tokens": "token", "requests": "次数"}.get(rule.metric, rule.metric)
         return (
-            f" ，剩余{remain_label} {self._format_amount(progress['remaining'], rule.metric)}"
-            f" ，实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
-            f" ，限额速度 {self._format_rate(progress['plan_speed'], rule.metric)}"
+            f"{self._format_progress_bar(progress['actual'], rule.limit)}\n"
+            f"\n实际速度 {self._format_rate(progress['actual_speed'], rule.metric)}"
+            f"\n限额速度 {self._format_rate(progress['plan_speed'], rule.metric)}"
         )
 
     def _status_text(
@@ -794,7 +777,6 @@ class HoldOnPlugin(MaiBotPlugin):
         now: Optional[datetime] = None,
     ) -> str:
         now = now or end
-        elapsed = max(1.0, (now - start).total_seconds())
         lines = [
             "【消耗监控】",
             f"【时间】{start:%m-%d} {start:%H:%M} ~ {end:%H:%M}",
@@ -835,7 +817,7 @@ class HoldOnPlugin(MaiBotPlugin):
             lines.append("【最近错误】监听目标暂无错误记录")
 
         lines.append("")
-        lines.append("【额度使用】")
+        lines.append("【统计】")
         groups = list(metrics.get("groups") or [])
         targets = self._status_targets(metrics)
         if not targets:
@@ -860,30 +842,12 @@ class HoldOnPlugin(MaiBotPlugin):
             )
             suffix = self._rate_suffix(scope=scope, target=target, groups=groups, now=now)
             target_lines.append(f"【{scope}:{target or '*'}】")
-            if self.config.budget.enabled and self.config.budget.items:
-                rule = self._find_budget_rule(scope, target, now)
-                if rule is not None:
-                    progress = budget_progress(groups, rule, now)
-                    target_lines.append(
-                        f"额度 {self._format_progress_bar(progress['actual'], rule.amount)} "
-                        f"{self._format_amount(progress['actual'], rule.metric)} / "
-                        f"{self._format_amount(rule.amount, rule.metric)}"
-                    )
-            else:
-                rule = self._find_static_rule(scope, target)
-                if rule is not None:
-                    progress = static_progress(groups, rule)
-                    target_lines.append(
-                        f"额度 {self._format_progress_bar(progress['actual'], rule.limit)} "
-                        f"{self._format_amount(progress['actual'], rule.metric)} / "
-                        f"{self._format_amount(rule.limit, rule.metric)}"
-                    )
             target_lines.append(
-                f"统计 成功 {int(success['requests'])} / 失败 {fails} / 限速 {hits}，"
-                f"token {self._format_tokens_m(success['tokens'])}，"
-                f"成本 {self._format_cost_per_hour(success['cost'], elapsed)}"
-                f"{suffix}"
+                f"成功 {int(success['requests'])} / 失败 {fails} / 限速 {hits}"
+                f"\ntoken {self._format_tokens_m(success['tokens'])}"
             )
+            if suffix:
+                target_lines.append(f"额度 \n{suffix}")
             target_lines.append("")
         lines.extend(target_lines[:-1])
         return "\n".join(lines)
