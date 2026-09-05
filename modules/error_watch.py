@@ -1,4 +1,4 @@
-"""监听宿主失败快照 JSON（schema_version=3，目录 logs/maisaka_prompt/llm_error）。"""
+"""监听宿主失败快照 JSON（schema v3/v6，目录 logs/maisaka_prompt/llm_error）。"""
 
 from __future__ import annotations
 
@@ -129,17 +129,20 @@ class ErrorSnapshotWatcher:
         model_info = attempt.get("model_info") if isinstance(attempt.get("model_info"), dict) else {}
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         api_provider = attempt.get("api_provider") if isinstance(attempt.get("api_provider"), dict) else {}
+        request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
 
         model_name = str(
             attempt.get("model_name")
-            or model_info.get("name")
             or metadata.get("model_name")
+            or model_info.get("name")
+            or attempt.get("model")
             or ""
         ).strip()
         provider = str(
             attempt.get("provider_name")
-            or api_provider.get("name")
             or metadata.get("provider_name")
+            or attempt.get("provider")
+            or api_provider.get("name")
             or ""
         ).strip()
         if not model_name:
@@ -160,6 +163,8 @@ class ErrorSnapshotWatcher:
         feature = str(
             attempt.get("task_name")
             or attempt.get("request_type")
+            or request.get("task_name")
+            or request.get("request_type")
             or metadata.get("task_name")
             or metadata.get("request_type")
             or ""
@@ -177,15 +182,16 @@ class ErrorSnapshotWatcher:
 
     @staticmethod
     def _latest_failed_attempt(payload: Dict[str, Any]) -> Dict[str, Any]:
-        attempts = payload.get("attempts")
-        if not isinstance(attempts, list) or not attempts:
-            return {}
-        for item in reversed(attempts):
-            if not isinstance(item, dict):
+        for key in ("generation_attempts", "attempts"):
+            attempts = payload.get(key)
+            if not isinstance(attempts, list):
                 continue
-            err = item.get("error")
-            if isinstance(err, dict) and (err.get("message") or err.get("status_code") or err.get("type")):
-                return item
+            for item in reversed(attempts):
+                if not isinstance(item, dict):
+                    continue
+                err = item.get("error")
+                if isinstance(err, dict) and (err.get("message") or err.get("status_code") or err.get("type")):
+                    return item
         return {}
 
 
