@@ -43,7 +43,7 @@ class PluginConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用消耗限速")
-    config_version: str = Field(default="3.0.0", description="配置版本")
+    config_version: str = Field(default="3.3.0", description="配置版本")
     auto_detect_models: bool = Field(default=True, description="自动同步模型、厂商和功能")
     model_config_path: str = Field(default="", description="宿主 model_config.toml 路径，留空自动查找")
     forward_image_threshold: int = Field(default=0, ge=0, description="合并转发消息图片数达到该值时阻止入站；0 表示禁用")
@@ -52,7 +52,7 @@ class StatsConfig(PluginConfigBase):
     __ui_label__ = "统计"
     __ui_icon__ = "bar-chart-2"
     __ui_order__ = 1
-    window_seconds: int = Field(default=3600, ge=60, description="控制统计窗口秒数")
+    window_seconds: int = Field(default=120, ge=60, description="控制统计窗口秒数")
     usage_limit: int = Field(default=5000, ge=100, le=5000, description="单次聚合最多读取的成功记录数")
 
 class CatalogModel(PluginConfigBase):
@@ -178,6 +178,8 @@ class HoldOnPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
+        self._manual_budget_release_until = datetime.min
+        self._next_check_at = self._check_deadline(datetime.now())
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
@@ -197,8 +199,12 @@ class HoldOnPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
+        self._next_check_at = self._check_deadline(datetime.now())
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
+
+    def _check_deadline(self, now: datetime) -> datetime:
+        return now + timedelta(seconds=max(1, int(self.config.stats.window_seconds or 120)))
 
     async def _discover_catalog(self) -> Dict[str, Any]:
         extra = [self.config.plugin.model_config_path] if self.config.plugin.model_config_path.strip() else []
@@ -301,7 +307,7 @@ class HoldOnPlugin(MaiBotPlugin):
 
     def _in_budget_hours(self, now: datetime, item: BudgetRuleConfig) -> bool:
         start, end = self._period(now, item)
-        return start <= now <= end
+        return start <= now < end
 
     def _seconds_until_next_budget_start(self, now: datetime, item: BudgetRuleConfig) -> float:
         def parse(value: str) -> time:
@@ -876,9 +882,19 @@ class HoldOnPlugin(MaiBotPlugin):
             return {"action": "continue"}
         if self._should_abort_forward_images(message):
             return {"action": "abort"}
+        if self.state.is_holding():
+            return {"action": "abort"}
         await self._maybe_reset_error_streak()
+        now = datetime.now()
+        if now < self._next_check_at:
+            return {"action": "continue"}
+        self._next_check_at = self._check_deadline(now)
         decision = await self._check()
-        if decision:
+        budget_released = self.config.budget.enabled and now < self._manual_budget_release_until
+        if decision and not (
+            decision.kind == "rate"
+            and budget_released
+        ):
             newly = self.state.activate_hold(
                 seconds=float(decision.hold_seconds or 60),
                 reason=decision.reason,
@@ -936,6 +952,13 @@ class HoldOnPlugin(MaiBotPlugin):
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
             return await self._send(stream_id, "权限不足。")
         self.state.clear_hold()
+        self._next_check_at = self._check_deadline(datetime.now())
+        if self.config.budget.enabled and self.config.budget.items:
+            now = datetime.now()
+            self._manual_budget_release_until = max(
+                (self._period(now, item)[1] for item in self.config.budget.items),
+                default=now,
+            )
         return await self._send(stream_id, "已解除。")
 
 

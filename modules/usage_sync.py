@@ -93,7 +93,7 @@ def aggregate_usage_rows(
             continue
         view = usage_row_view(row)
         ts = float(view.get("ts") or 0)
-        if ts <= 0 or ts < start_ts or ts > end_ts:
+        if ts <= 0 or ts < start_ts or ts >= end_ts:
             continue
         window_rows.append(view)
 
