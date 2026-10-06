@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .error_classify import classify_error
 
 ErrorHandler = Callable[..., Awaitable[None]]
+
+_SEEN_MAX = 5000
+_SEEN_KEEP = 2500
 
 
 class ErrorSnapshotWatcher:
@@ -26,7 +30,7 @@ class ErrorSnapshotWatcher:
         self._interval = max(0.5, float(interval_seconds or 2.0))
         self._on_error = on_error
         self._logger = logger
-        self._seen: Set[str] = set()
+        self._seen: "OrderedDict[str, None]" = OrderedDict()  # FIFO 淘汰最旧路径
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._bootstrapped = False
@@ -47,10 +51,15 @@ class ErrorSnapshotWatcher:
             except Exception:
                 task.cancel()
 
+    def _mark_seen(self, key: str) -> None:
+        self._seen[key] = None
+        if len(self._seen) > _SEEN_MAX:
+            for _ in range(len(self._seen) - _SEEN_KEEP):
+                self._seen.popitem(last=False)
+
     async def _loop(self) -> None:
         if not self._bootstrapped:
-            for path in self._iter_snapshot_files():
-                self._seen.add(str(path.resolve()))
+            await asyncio.to_thread(self._bootstrap)
             self._bootstrapped = True
             self._logger.info(
                 "hold_on 错误快照监听已启动：roots=%s interval=%.1fs seen=%s",
@@ -68,6 +77,10 @@ class ErrorSnapshotWatcher:
             except asyncio.TimeoutError:
                 continue
 
+    def _bootstrap(self) -> None:
+        for path in self._iter_snapshot_files():
+            self._seen[str(path.resolve())] = None
+
     def _iter_snapshot_files(self) -> List[Path]:
         files: List[Path] = []
         for root in self._roots:
@@ -84,7 +97,8 @@ class ErrorSnapshotWatcher:
                 self._logger.debug("hold_on 列举快照目录失败 %s: %s", root, exc)
         return files
 
-    async def _scan_once(self) -> None:
+    def _collect_new_files(self) -> List[Path]:
+        new_files: List[Path] = []
         for path in self._iter_snapshot_files():
             key = str(path.resolve())
             if key in self._seen:
@@ -94,13 +108,28 @@ class ErrorSnapshotWatcher:
                     continue
             except OSError:
                 continue
-            self._seen.add(key)
-            if len(self._seen) > 5000:
-                self._seen = set(list(self._seen)[-2500:])
+            new_files.append(path)
+        return new_files
+
+    def _collect_payloads(
+        self, files: List[Path]
+    ) -> List[Tuple[Path, Optional[Dict[str, Any]]]]:
+        out: List[Tuple[Path, Optional[Dict[str, Any]]]] = []
+        for path in files:
+            self._mark_seen(str(path.resolve()))
             payload = self._read_json(path)
             if not payload:
+                out.append((path, None))
                 continue
-            extracted = self._extract_error(payload, path)
+            out.append((path, self._extract_error(payload, path)))
+        return out
+
+    async def _scan_once(self) -> None:
+        candidates = await asyncio.to_thread(self._collect_new_files)
+        if not candidates:
+            return
+        ready = await asyncio.to_thread(self._collect_payloads, candidates)
+        for path, extracted in ready:
             if not extracted:
                 continue
             try:

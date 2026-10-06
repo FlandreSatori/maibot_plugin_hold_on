@@ -1,7 +1,8 @@
-﻿"""从宿主 llm_usage（ModelUsage）读取成功调用与消耗，插件内聚合。"""
+"""从宿主 llm_usage（ModelUsage）读取成功调用与消耗，插件内聚合。"""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -174,3 +175,95 @@ async def aggregate_usage(
         start_ts=start.timestamp(),
         end_ts=end.timestamp(),
     )
+
+
+def _row_id(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+class IncrementalUsageStore:
+    """增量跟踪 ModelUsage：首次全量播种，之后只合并 id 更大的新行。
+
+    避免每次检查都拉取全部 5000 行记录；聚合在插件内存中完成。
+    """
+
+    def __init__(
+        self,
+        *,
+        max_rows: int = 5000,
+        retention_seconds: float = 7 * 24 * 3600,
+    ) -> None:
+        self._rows: Dict[int, Dict[str, Any]] = {}
+        self._fallback: Optional[List[Dict[str, Any]]] = None  # 行无 id 时退化为全量缓存
+        self._last_id = -1
+        self._max_rows = max(100, int(max_rows or 5000))
+        self._retention = max(3600.0, float(retention_seconds))
+        self._lock = asyncio.Lock()
+
+    async def refresh(
+        self,
+        ctx: Any,
+        *,
+        full_limit: int,
+        incremental_limit: int = 500,
+    ) -> None:
+        """拉取新记录合并进内存；无新行时不做任何重计算。"""
+
+        logger = getattr(ctx, "logger", None)
+        database = getattr(ctx, "db", None)
+        if database is None:
+            if logger is not None:
+                logger.warning("hold_on 缺少 ctx.db，无法读取 llm_usage")
+            return
+        async with self._lock:
+            if not self._rows and self._fallback is None:
+                limit = max(100, int(full_limit or 5000))
+            else:
+                limit = max(100, int(incremental_limit or 500))
+            rows = await _query_model_usage(database, limit=limit, logger=logger)
+            if not rows:
+                return
+            if all(_row_id(row) <= 0 for row in rows):
+                # 数据行没有可用 id，无法增量：退化为缓存最近一批
+                self._fallback = rows
+                return
+            self._fallback = None
+            new_rows = 0
+            for row in rows:
+                rid = _row_id(row)
+                if rid <= self._last_id:
+                    continue
+                self._rows[rid] = row
+                if rid > self._last_id:
+                    self._last_id = rid
+                new_rows += 1
+            if new_rows:
+                self._prune()
+
+    def _prune(self) -> None:
+        """按时间淘汰旧行；超出容量时优先丢弃最旧的。"""
+
+        if not self._rows:
+            return
+        cutoff = datetime.now().timestamp() - self._retention
+        stale = [
+            rid
+            for rid, row in self._rows.items()
+            if float(parse_timestamp(row.get("timestamp")) or 0) < cutoff
+        ]
+        for rid in stale:
+            del self._rows[rid]
+        if len(self._rows) > self._max_rows:
+            ordered = sorted(
+                self._rows.items(),
+                key=lambda item: float(parse_timestamp(item[1].get("timestamp")) or 0),
+                reverse=True,
+            )
+            self._rows = dict(ordered[: self._max_rows])
+
+    def aggregate(self, start_ts: float, end_ts: float) -> Dict[str, Any]:
+        rows = self._fallback if self._fallback is not None else list(self._rows.values())
+        return aggregate_usage_rows(rows, start_ts=float(start_ts), end_ts=float(end_ts))

@@ -61,7 +61,13 @@ class HoldInfo:
 class HoldOnState:
     """错误滑动窗口 + 全局停模。"""
 
-    def __init__(self, path: Path, *, max_events: int = 5000) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_events: int = 5000,
+        save_debounce_seconds: float = 1.0,
+    ) -> None:
         self._path = path
         self._lock = threading.RLock()
         self._events: List[StatEvent] = []
@@ -73,7 +79,16 @@ class HoldOnState:
         self._streak_scope: str = ""
         self._streak_target: str = ""
         self._rate_limit_events: List[Dict[str, Any]] = []
+        # 去抖落盘：save() 只标记脏位，由后台线程合并写入，避免阻塞事件循环
+        self._dirty = False
+        self._flush_event = threading.Event()
+        self._closing = False
+        self._save_debounce = max(0.2, float(save_debounce_seconds))
         self.load()
+        self._writer = threading.Thread(
+            target=self._writer_loop, name="hold_on_state_writer", daemon=True
+        )
+        self._writer.start()
 
     def load(self) -> None:
         with self._lock:
@@ -136,6 +151,48 @@ class HoldOnState:
                 self._rate_limit_events = loaded_rate[-self._max_events :]
 
     def save(self) -> None:
+        """标记待落盘；去抖窗口内的多次变更合并为一次磁盘写入。"""
+        with self._lock:
+            self._dirty = True
+        self._flush_event.set()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """等待当前已标记的变更写完（测试/关停用）。"""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            if not self._dirty and not self._flush_event.is_set():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def close(self) -> None:
+        """关停后台写入线程并保证脏数据落盘。"""
+        self.flush(5.0)
+        self._closing = True
+        self._flush_event.set()
+        writer = getattr(self, "_writer", None)
+        if writer is not None and writer.is_alive():
+            writer.join(timeout=5.0)
+
+    def _writer_loop(self) -> None:
+        while True:
+            self._flush_event.wait()
+            if self._closing:
+                try:
+                    self._write_once()
+                except Exception:
+                    pass
+                return
+            time.sleep(self._save_debounce)  # 去抖：合并窗口内的连续 save
+            self._flush_event.clear()
+            try:
+                self._write_once()
+            except Exception:
+                pass  # 落盘失败不影响运行
+            if self._dirty:
+                self._flush_event.set()
+
+    def _write_once(self) -> None:
         with self._lock:
             self._prune_locked(time.time(), keep_seconds=7 * 24 * 3600)
             payload = {
@@ -157,10 +214,12 @@ class HoldOnState:
                 "rate_limit_events": list(self._rate_limit_events[-self._max_events :]),
                 "saved_at": time.time(),
             }
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            self._dirty = False
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(self._path)
 
     def _prune_locked(self, now: float, keep_seconds: float = 7 * 24 * 3600) -> None:
         cutoff = now - max(3600.0, float(keep_seconds))

@@ -1,5 +1,6 @@
 """稍，稍等一下！: LLM 消耗监控与入站限速。"""
 from __future__ import annotations
+import asyncio
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -18,7 +19,7 @@ try:
     from .modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
     from .modules.model_discover import discover_models
     from .modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
-    from .modules.usage_sync import aggregate_usage
+    from .modules.usage_sync import IncrementalUsageStore
     from .modules.state import HoldOnState, StatEvent
     from .modules.forward_guard import count_images_in_message, should_abort_for_forward_images
 except ImportError:  # pragma: no cover - 兼容直接脚本导入
@@ -34,7 +35,7 @@ except ImportError:  # pragma: no cover - 兼容直接脚本导入
     from modules.error_watch import ErrorSnapshotWatcher, resolve_watch_roots
     from modules.model_discover import discover_models
     from modules.policy import FeatureModels, HoldEvent, HoldOnPolicy, ThresholdRule
-    from modules.usage_sync import aggregate_usage
+    from modules.usage_sync import IncrementalUsageStore
     from modules.state import HoldOnState, StatEvent
     from modules.forward_guard import count_images_in_message, should_abort_for_forward_images
 
@@ -178,8 +179,10 @@ class HoldOnPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
+        self._usage_store = IncrementalUsageStore(max_rows=int(self.config.stats.usage_limit or 5000))
         self._manual_budget_release_until = datetime.min
         self._next_check_at = self._check_deadline(datetime.now())
+        self._next_reset_check_at = datetime.min
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
         self._watcher: Optional[ErrorSnapshotWatcher] = None
@@ -196,10 +199,13 @@ class HoldOnPlugin(MaiBotPlugin):
         if self._watcher:
             await self._watcher.stop()
             self._watcher = None
+        await asyncio.to_thread(self.state.close)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
         self._next_check_at = self._check_deadline(datetime.now())
+        self._next_reset_check_at = datetime.min
+        self._usage_store = IncrementalUsageStore(max_rows=int(self.config.stats.usage_limit or 5000))
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
 
@@ -284,12 +290,12 @@ class HoldOnPlugin(MaiBotPlugin):
         return True
 
     async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
-        return await aggregate_usage(
+        await self._usage_store.refresh(
             self.ctx,
-            start,
-            end,
-            self.config.stats.usage_limit,
+            full_limit=int(self.config.stats.usage_limit or 5000),
+            incremental_limit=max(200, min(1000, int(self.config.stats.usage_limit or 5000) // 5)),
         )
+        return self._usage_store.aggregate(start.timestamp(), end.timestamp())
 
     def _period(self, now: datetime, item: BudgetRuleConfig) -> tuple[datetime, datetime]:
         def parse(value: str) -> time:
@@ -884,8 +890,10 @@ class HoldOnPlugin(MaiBotPlugin):
             return {"action": "abort"}
         if self.state.is_holding():
             return {"action": "abort"}
-        await self._maybe_reset_error_streak()
         now = datetime.now()
+        if now >= self._next_reset_check_at:
+            self._next_reset_check_at = now + timedelta(seconds=5)
+            await self._maybe_reset_error_streak()
         if now < self._next_check_at:
             return {"action": "continue"}
         self._next_check_at = self._check_deadline(now)
