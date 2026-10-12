@@ -1,4 +1,8 @@
-"""监听宿主失败快照 JSON（schema v3/v6，目录 logs/maisaka_prompt/llm_error）。"""
+"""监听宿主失败快照 JSON（schema v3/v6，目录 logs/maisaka_prompt/llm_error）。
+
+v6 快照首败写 `.json`，后续重试追加 `.events.jsonl` 事件流；出现 `succeeded`
+事件表示该逻辑请求重试成功，需要撤销此前按 `.json` 计入的错误。
+"""
 
 from __future__ import annotations
 
@@ -25,12 +29,17 @@ class ErrorSnapshotWatcher:
         interval_seconds: float,
         on_error: ErrorHandler,
         logger: Any,
+        on_retract: Optional[ErrorHandler] = None,
     ) -> None:
         self._roots = [Path(p) for p in roots if p]
         self._interval = max(0.5, float(interval_seconds or 2.0))
         self._on_error = on_error
+        self._on_retract = on_retract
         self._logger = logger
         self._seen: "OrderedDict[str, None]" = OrderedDict()  # FIFO 淘汰最旧路径
+        self._events_state: Dict[str, Tuple[float, int]] = {}  # .events.jsonl -> (mtime, size)
+        self._retracted: set = set()  # 已撤销计数的事件流路径
+        self._counted: set = set()  # 本次运行中已通过 on_error 计数的快照路径
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._bootstrapped = False
@@ -80,6 +89,91 @@ class ErrorSnapshotWatcher:
     def _bootstrap(self) -> None:
         for path in self._iter_snapshot_files():
             self._seen[str(path.resolve())] = None
+        # 记录启动时已存在的事件流状态，避免把历史成功事件当成新变化重复处理
+        for path in self._iter_event_files():
+            self._remember_events_state(path)
+
+    @staticmethod
+    def _events_path_for(snapshot_path: Path) -> Path:
+        return snapshot_path.with_suffix(".events.jsonl")
+
+    @staticmethod
+    def _snapshot_path_for(events_path: Path) -> Path:
+        name = events_path.name
+        if name.endswith(".events.jsonl"):
+            return events_path.parent / (name[: -len(".events.jsonl")] + ".json")
+        return events_path.with_suffix(".json")
+
+    def _iter_event_files(self) -> List[Path]:
+        files: List[Path] = []
+        for root in self._roots:
+            if not root.exists():
+                continue
+            try:
+                if root.is_file():
+                    if root.name.endswith(".events.jsonl"):
+                        files.append(root)
+                    else:
+                        candidate = self._events_path_for(root)
+                        if candidate.exists():
+                            files.append(candidate)
+                    continue
+                for path in root.rglob("*.events.jsonl"):
+                    if path.is_file():
+                        files.append(path)
+            except Exception as exc:
+                self._logger.debug("hold_on 列举事件流目录失败 %s: %s", root, exc)
+        return files
+
+    def _remember_events_state(self, path: Path) -> None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        self._events_state[str(path.resolve())] = (stat.st_mtime, stat.st_size)
+
+    def _events_has_succeeded(self, events_path: Path) -> bool:
+        try:
+            with events_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue  # 可能是正在写入的截断行
+                    if isinstance(event, dict) and str(event.get("type") or "") == "succeeded":
+                        return True
+        except OSError:
+            pass
+        return False
+
+    def _collect_retracts(self) -> List[Path]:
+        """找出出现 succeeded 事件的快照，返回对应 .json 路径用于撤销计数。"""
+        retracts: List[Path] = []
+        for path in self._iter_event_files():
+            key = str(path.resolve())
+            if key in self._retracted:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            state = (stat.st_mtime, stat.st_size)
+            if self._events_state.get(key) == state:
+                continue
+            self._events_state[key] = state
+            if not self._events_has_succeeded(path):
+                continue
+            snapshot = self._snapshot_path_for(path)
+            if str(snapshot.resolve()) not in self._counted:
+                # 该快照未在本次运行中计数（如自带 succeeded 的新快照），无需撤销
+                continue
+            self._retracted.add(key)
+            self._mark_seen(str(snapshot.resolve()))
+            retracts.append(snapshot)
+        return retracts
 
     def _iter_snapshot_files(self) -> List[Path]:
         files: List[Path] = []
@@ -117,6 +211,9 @@ class ErrorSnapshotWatcher:
         out: List[Tuple[Path, Optional[Dict[str, Any]]]] = []
         for path in files:
             self._mark_seen(str(path.resolve()))
+            if self._events_has_succeeded(self._events_path_for(path)):
+                # 首次读取时事件流已记录成功：该逻辑请求重试成功，不计错误
+                continue
             payload = self._read_json(path)
             if not payload:
                 out.append((path, None))
@@ -126,16 +223,23 @@ class ErrorSnapshotWatcher:
 
     async def _scan_once(self) -> None:
         candidates = await asyncio.to_thread(self._collect_new_files)
-        if not candidates:
-            return
         ready = await asyncio.to_thread(self._collect_payloads, candidates)
         for path, extracted in ready:
             if not extracted:
                 continue
+            self._counted.add(str(path.resolve()))
             try:
                 await self._on_error(**extracted)
             except Exception as exc:
                 self._logger.warning("hold_on 处理错误快照失败 %s: %s", path.name, exc)
+        if self._on_retract is None:
+            return
+        retracts = await asyncio.to_thread(self._collect_retracts)
+        for snapshot_path in retracts:
+            try:
+                await self._on_retract(source_path=str(snapshot_path))
+            except Exception as exc:
+                self._logger.warning("hold_on 撤销错误计数失败 %s: %s", snapshot_path.name, exc)
 
     @staticmethod
     def _read_json(path: Path) -> Optional[Dict[str, Any]]:

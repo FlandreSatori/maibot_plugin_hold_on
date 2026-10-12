@@ -191,6 +191,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 roots=resolve_watch_roots(self.config.error_watch.roots),
                 interval_seconds=self.config.error_watch.interval_seconds,
                 on_error=self._on_snapshot_error,
+                on_retract=self._on_snapshot_retract,
                 logger=self.ctx.logger,
             )
             self._watcher.start()
@@ -436,6 +437,7 @@ class HoldOnPlugin(MaiBotPlugin):
                 feature=feature,
                 error_type=error_type,
                 message=message,
+                source_path=source_path,
             )
             return
         event = self.policy.on_error(
@@ -445,6 +447,7 @@ class HoldOnPlugin(MaiBotPlugin):
             message=message,
             error_type=error_type,
             error=error,
+            source_path=source_path,
         )
         self.ctx.logger.warning(
             "hold_on 记录错误：model=%s provider=%s feature=%s type=%s path=%s hold=%s",
@@ -457,6 +460,18 @@ class HoldOnPlugin(MaiBotPlugin):
         )
         if event is not None:
             await self._notify_hold(event)
+
+    async def _on_snapshot_retract(self, *, source_path: str = "", **_: Any) -> None:
+        """快照事件流出现 succeeded：该逻辑请求重试成功，撤销已计入的错误。"""
+        if not self._active():
+            return
+        removed = self.state.retract_errors_by_source(source_path)
+        if removed:
+            self.ctx.logger.info(
+                "hold_on 撤销错误计数：path=%s 撤销 %d 条（重试成功）",
+                Path(source_path).name if source_path else "",
+                removed,
+            )
 
     @staticmethod
     def _pick_stream_id(payload: Any) -> str:
@@ -878,6 +893,11 @@ class HoldOnPlugin(MaiBotPlugin):
         uid = str(user_id or "").strip()
         scoped = f"{platform}:{uid}" if platform else uid
         return uid in {str(x).strip() for x in self.config.permission.whitelist} or scoped in self.config.permission.whitelist
+
+    async def _permission_denied(self, stream_id: str) -> None:
+        """无权限时的处理；notify_permission_denied=False 时静默。"""
+        if bool(getattr(self.config.permission, "notify_permission_denied", True)):
+            await self._send(stream_id, "权限不足。")
     async def _send(self, stream_id: str, text: str) -> tuple[bool, str, bool]:
         if stream_id: await self.ctx.send.text(text, stream_id)
         return True, text, True
@@ -900,7 +920,7 @@ class HoldOnPlugin(MaiBotPlugin):
         decision = await self._check()
         budget_released = self.config.budget.enabled and now < self._manual_budget_release_until
         if decision and not (
-            decision.kind == "rate"
+            decision.kind in ("rate", "off_hours")
             and budget_released
         ):
             newly = self.state.activate_hold(
@@ -930,7 +950,7 @@ class HoldOnPlugin(MaiBotPlugin):
     async def cmd_status(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
-            return await self._send(stream_id, "权限不足。")
+            return await self._permission_denied(stream_id)
         await self._maybe_reset_error_streak()
         now = datetime.now()
         if self.config.budget.enabled and self.config.budget.items:
@@ -958,15 +978,17 @@ class HoldOnPlugin(MaiBotPlugin):
     async def cmd_clear(self, **kwargs: Any):
         stream_id = kwargs.get("stream_id", "")
         if not await self._is_admin(kwargs.get("platform", ""), kwargs.get("user_id", "")):
-            return await self._send(stream_id, "权限不足。")
+            return await self._permission_denied(stream_id)
         self.state.clear_hold()
         self._next_check_at = self._check_deadline(datetime.now())
         if self.config.budget.enabled and self.config.budget.items:
             now = datetime.now()
-            self._manual_budget_release_until = max(
-                (self._period(now, item)[1] for item in self.config.budget.items),
-                default=now,
-            )
+            deadlines = []
+            for item in self.config.budget.items:
+                start, end = self._period(now, item)
+                # 时段内释放到本周期结束；时段外（如 0~22 预算在 22:00 后）释放到下一周期开始
+                deadlines.append(end if now < end else start + timedelta(days=1))
+            self._manual_budget_release_until = max(deadlines, default=now)
         return await self._send(stream_id, "已解除。")
 
 

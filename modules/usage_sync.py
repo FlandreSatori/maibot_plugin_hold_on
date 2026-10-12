@@ -219,10 +219,12 @@ class IncrementalUsageStore:
                 logger.warning("hold_on 缺少 ctx.db，无法读取 llm_usage")
             return
         async with self._lock:
-            if not self._rows and self._fallback is None:
-                limit = max(100, int(full_limit or 5000))
-            else:
-                limit = max(100, int(incremental_limit or 500))
+            incremental = bool(self._rows) or self._fallback is not None
+            limit = (
+                max(100, int(incremental_limit or 500))
+                if incremental
+                else max(100, int(full_limit or 5000))
+            )
             rows = await _query_model_usage(database, limit=limit, logger=logger)
             if not rows:
                 return
@@ -231,17 +233,43 @@ class IncrementalUsageStore:
                 self._fallback = rows
                 return
             self._fallback = None
-            new_rows = 0
-            for row in rows:
-                rid = _row_id(row)
-                if rid <= self._last_id:
-                    continue
-                self._rows[rid] = row
-                if rid > self._last_id:
-                    self._last_id = rid
-                new_rows += 1
-            if new_rows:
-                self._prune()
+            prev_last_id = self._last_id
+            _, min_new_id = self._merge_rows(rows)
+            if (
+                incremental
+                and prev_last_id >= 0
+                and len(rows) >= limit
+                and min_new_id > prev_last_id + 1
+            ):
+                # 增量窗口截断：两次刷新之间新增行数超过窗口，中间行已丢失，立即全量补齐
+                full_rows = await _query_model_usage(
+                    database, limit=max(100, int(full_limit or 5000)), logger=logger
+                )
+                if full_rows:
+                    self._merge_rows(full_rows)
+
+    def _merge_rows(self, rows: List[Dict[str, Any]]) -> tuple[int, int]:
+        """合并带 id 的行（查询结果按 id 倒序返回）；返回 (新增行数, 本批最小新 id，无新增时为 0)。
+
+        跳过判断基于合并前的 _last_id，避免倒序遍历时把尚未合并的较小 id 误判为旧行。
+        """
+
+        prev_last_id = self._last_id
+        new_rows = 0
+        min_new_id = 0
+        for row in rows:
+            rid = _row_id(row)
+            if rid <= prev_last_id:
+                continue
+            self._rows[rid] = row
+            if rid > self._last_id:
+                self._last_id = rid
+            if min_new_id == 0 or rid < min_new_id:
+                min_new_id = rid
+            new_rows += 1
+        if new_rows:
+            self._prune()
+        return new_rows, min_new_id
 
     def _prune(self) -> None:
         """按时间淘汰旧行；超出容量时优先丢弃最旧的。"""

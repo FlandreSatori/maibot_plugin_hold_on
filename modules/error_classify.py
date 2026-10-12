@@ -7,6 +7,10 @@ import re
 from typing import Any, Dict, Optional
 
 _STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
+_CODE_RES = {
+    code: re.compile(rf"\b{code}\b")
+    for code in ("429", "403", "401", "408", "500", "502", "503", "504")
+}
 
 
 def classify_error(
@@ -35,8 +39,9 @@ def classify_error(
 
     blob = " ".join(candidates + [str(message or "")]).lower()
 
-    for code in ("429", "403", "401", "408", "500", "502", "503", "504"):
-        if code in blob:
+    # 带词边界匹配，避免 "5000" 误判为 500、"1429" 误判为 429
+    for code, pattern in _CODE_RES.items():
+        if pattern.search(blob):
             return code
 
     match = _STATUS_RE.search(blob)

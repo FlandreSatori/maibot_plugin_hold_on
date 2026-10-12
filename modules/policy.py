@@ -88,6 +88,7 @@ class HoldOnPolicy:
         message: str = "",
         error_type: str = "",
         error: Optional[dict] = None,
+        source_path: str = "",
     ) -> Optional[HoldEvent]:
         model = str(model_name or "").strip()
         if not model:
@@ -101,6 +102,7 @@ class HoldOnPolicy:
             feature=feat,
             error_type=etype,
             message=message,
+            source_path=source_path,
         )
         return self._evaluate_rules(
             model=model,

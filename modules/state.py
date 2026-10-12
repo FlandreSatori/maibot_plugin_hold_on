@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def norm_path(path: Any) -> str:
+    """归一化路径用于 retract 匹配；解析失败时退回原始字符串。"""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).resolve())
+    except Exception:
+        return text
+
+
 @dataclass
 class StatEvent:
     """一次失败事件。"""
@@ -20,6 +31,7 @@ class StatEvent:
     feature: str = ""
     error_type: str = ""
     message: str = ""
+    source_path: str = ""  # 产生该错误的快照 JSON 路径；重试成功时用于撤销
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -37,6 +49,7 @@ class StatEvent:
             feature=str(raw.get("feature") or ""),
             error_type=str(raw.get("error_type") or ""),
             message=str(raw.get("message") or ""),
+            source_path=str(raw.get("source_path") or ""),
         )
 
 
@@ -253,6 +266,7 @@ class HoldOnState:
         feature: str = "",
         error_type: str = "other",
         message: str = "",
+        source_path: str = "",
     ) -> StatEvent:
         model = str(model or "").strip()
         provider = str(provider or "").strip() or (self.provider_of(model) if model else "")
@@ -263,6 +277,7 @@ class HoldOnState:
             feature=str(feature or "").strip(),
             error_type=str(error_type or "other").strip() or "other",
             message=str(message or "").strip()[:300],
+            source_path=str(source_path or "").strip(),
         )
         with self._lock:
             if model and provider:
@@ -271,6 +286,24 @@ class HoldOnState:
             self._prune_locked(event.ts)
             self.save()
             return event
+
+    def retract_errors_by_source(self, source_path: str) -> int:
+        """按快照路径撤销已计数错误（重试成功的逻辑请求不算错误），返回撤销条数。"""
+        key = norm_path(source_path)
+        if not key:
+            return 0
+        with self._lock:
+            kept: List[StatEvent] = []
+            removed = 0
+            for event in self._events:
+                if event.source_path and norm_path(event.source_path) == key:
+                    removed += 1
+                    continue
+                kept.append(event)
+            if removed:
+                self._events = kept
+                self.save()
+            return removed
 
     def events_since(self, window_seconds: float, now: Optional[float] = None) -> List[StatEvent]:
         ts = time.time() if now is None else now
