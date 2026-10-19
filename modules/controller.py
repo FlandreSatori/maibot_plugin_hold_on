@@ -107,8 +107,12 @@ def budget_progress(groups: Iterable[Dict[str, Any]], rule: BudgetRule, now: dat
         ahead = plan_speed * max(0.0, float(rule.overshoot_time or 0.0))
         allowance = min(rule.amount, expected + ahead)
     else:
-        # strict：不允许超过当前时刻计划曲线
-        allowance = expected
+        # strict：不允许超过计划曲线，但给周期起点一个请求粒度缓冲——
+        # 计划曲线在起点附近增长极慢，单个请求的成本必然超过秒级计划量，
+        # 不加缓冲时零点后首批请求就会立即超速并触发长停模。
+        # 缓冲为 overshoot_time 秒的计划额度，不与 expected 叠加，整体仍严于 balanced。
+        ahead = plan_speed * max(0.0, float(rule.overshoot_time or 0.0))
+        allowance = min(rule.amount, max(expected, ahead))
     remaining = max(0.0, rule.amount - actual)
     actual_speed = actual / elapsed if elapsed > 0 else 0.0
     recover_speed = remaining / remaining_seconds if remaining_seconds > 0 else 0.0

@@ -92,6 +92,7 @@ class HoldOnState:
         self._streak_scope: str = ""
         self._streak_target: str = ""
         self._rate_limit_events: List[Dict[str, Any]] = []
+        self._usage_checkpoint: Optional[Dict[str, Any]] = None  # 用量聚合基线，重启后免全量播种
         # 去抖落盘：save() 只标记脏位，由后台线程合并写入，避免阻塞事件循环
         self._dirty = False
         self._flush_event = threading.Event()
@@ -162,6 +163,9 @@ class HoldOnState:
                         }
                     )
                 self._rate_limit_events = loaded_rate[-self._max_events :]
+            ckpt = raw.get("usage_checkpoint")
+            if isinstance(ckpt, dict):
+                self._usage_checkpoint = ckpt
 
     def save(self) -> None:
         """标记待落盘；去抖窗口内的多次变更合并为一次磁盘写入。"""
@@ -225,6 +229,7 @@ class HoldOnState:
                 "streak_scope": str(self._streak_scope or ""),
                 "streak_target": str(self._streak_target or ""),
                 "rate_limit_events": list(self._rate_limit_events[-self._max_events :]),
+                "usage_checkpoint": self._usage_checkpoint,
                 "saved_at": time.time(),
             }
             self._dirty = False
@@ -242,6 +247,18 @@ class HoldOnState:
             self._events = self._events[-self._max_events :]
         if len(self._rate_limit_events) > self._max_events:
             self._rate_limit_events = self._rate_limit_events[-self._max_events :]
+
+    def usage_checkpoint(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            ckpt = self._usage_checkpoint
+            return dict(ckpt) if isinstance(ckpt, dict) else None
+
+    def set_usage_checkpoint(self, ckpt: Optional[Dict[str, Any]]) -> None:
+        with self._lock:
+            if ckpt is None and self._usage_checkpoint is None:
+                return
+            self._usage_checkpoint = dict(ckpt) if isinstance(ckpt, dict) else None
+            self.save()
 
     def register_model_provider(self, model: str, provider: str) -> None:
         model = str(model or "").strip()

@@ -1,6 +1,7 @@
 """稍，稍等一下！: LLM 消耗监控与入站限速。"""
 from __future__ import annotations
 import asyncio
+import hashlib
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -44,7 +45,7 @@ class PluginConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用消耗限速")
-    config_version: str = Field(default="3.3.0", description="配置版本")
+    config_version: str = Field(default="3.4.0", description="配置版本")
     auto_detect_models: bool = Field(default=True, description="自动同步模型、厂商和功能")
     model_config_path: str = Field(default="", description="宿主 model_config.toml 路径，留空自动查找")
     forward_image_threshold: int = Field(default=0, ge=0, description="合并转发消息图片数达到该值时阻止入站；0 表示禁用")
@@ -54,7 +55,12 @@ class StatsConfig(PluginConfigBase):
     __ui_icon__ = "bar-chart-2"
     __ui_order__ = 1
     window_seconds: int = Field(default=120, ge=60, description="控制统计窗口秒数")
-    usage_limit: int = Field(default=5000, ge=100, le=5000, description="单次聚合最多读取的成功记录数")
+    usage_limit: int = Field(
+        default=5000,
+        ge=100,
+        le=200000,
+        description="单次聚合最多读取的成功记录数；建议大于单日全供应商请求总量，否则当日统计可能偏小",
+    )
 
 class CatalogModel(PluginConfigBase):
     name: str = Field(default="", description="模型别名")
@@ -95,7 +101,7 @@ class BudgetRuleConfig(PluginConfigBase):
         default="strict",
         description="超速策略：strict 不超速；balanced 允许在 overshoot_time 秒内超速",
     )
-    overshoot_time: float = Field(default=300, ge=0, description="balanced 下允许超速的秒数")
+    overshoot_time: float = Field(default=300, ge=0, description="balanced 下允许超速的秒数；strict 下用作周期起点的请求粒度缓冲")
     off_hours: Literal["hold", "continue"] = Field(
         default="continue",
         description="预算时段外：hold=停止响应；continue=不控速，继续花完剩余额度（用尽后仍停止）",
@@ -179,7 +185,12 @@ class HoldOnPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.state = HoldOnState(Path(self.ctx.paths.data_dir) / "hold_on_state.json")
-        self._usage_store = IncrementalUsageStore(max_rows=int(self.config.stats.usage_limit or 5000))
+        self._usage_store = IncrementalUsageStore(
+            max_rows=int(self.config.stats.usage_limit or 5000),
+            checkpoint=self._load_usage_checkpoint(),
+        )
+        if self._usage_store.checkpoint_active:
+            self.ctx.logger.info("hold_on 已恢复用量 checkpoint，跳过全量播种")
         self._manual_budget_release_until = datetime.min
         self._next_check_at = self._check_deadline(datetime.now())
         self._next_reset_check_at = datetime.min
@@ -200,13 +211,76 @@ class HoldOnPlugin(MaiBotPlugin):
         if self._watcher:
             await self._watcher.stop()
             self._watcher = None
+        self._maybe_export_usage_checkpoint(force=True)
         await asyncio.to_thread(self.state.close)
+
+    def _usage_config_hash(self) -> str:
+        """预算规则指纹：任一规则变化即判定 checkpoint 失效。"""
+        if not (self.config.budget.enabled and self.config.budget.items):
+            return ""
+        parts = [
+            "|".join(
+                str(value)
+                for value in (
+                    item.scope,
+                    item.target,
+                    item.metric,
+                    item.amount,
+                    item.start_time,
+                    item.end_time,
+                    item.strategy,
+                    item.overshoot_time,
+                    item.input_weight,
+                    item.output_weight,
+                )
+            )
+            for item in self.config.budget.items
+        ]
+        return hashlib.md5(";".join(parts).encode("utf-8")).hexdigest()
+
+    def _expected_usage_anchor(self) -> float:
+        if not (self.config.budget.enabled and self.config.budget.items):
+            return 0.0
+        now = datetime.now()
+        return min(self._period(now, item)[0] for item in self.config.budget.items).timestamp()
+
+    def _load_usage_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """校验状态文件中的用量 checkpoint；预算规则或周期不匹配时放弃。"""
+        ckpt = self.state.usage_checkpoint()
+        if not isinstance(ckpt, dict):
+            return None
+        expected = self._expected_usage_anchor()
+        if expected <= 0 or str(ckpt.get("config_hash") or "") != self._usage_config_hash():
+            return None
+        try:
+            anchor = float(ckpt.get("anchor_ts") or 0)
+        except (TypeError, ValueError):
+            return None
+        if abs(anchor - expected) > 1.0:
+            return None
+        return ckpt
+
+    def _maybe_export_usage_checkpoint(self, force: bool = False) -> None:
+        if not (self.config.budget.enabled and self.config.budget.items):
+            return
+        try:
+            ckpt = self._usage_store.export_checkpoint(
+                config_hash=self._usage_config_hash(), force=force
+            )
+        except Exception as exc:
+            self.ctx.logger.warning("hold_on 导出用量 checkpoint 失败: %s", exc)
+            return
+        if ckpt:
+            self.state.set_usage_checkpoint(ckpt)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del scope, config_data, version
         self._next_check_at = self._check_deadline(datetime.now())
         self._next_reset_check_at = datetime.min
-        self._usage_store = IncrementalUsageStore(max_rows=int(self.config.stats.usage_limit or 5000))
+        self._usage_store = IncrementalUsageStore(
+            max_rows=int(self.config.stats.usage_limit or 5000),
+            checkpoint=self._load_usage_checkpoint(),
+        )
         self._catalog = await self._discover_catalog()
         self.policy = self._build_policy()
 
@@ -295,8 +369,11 @@ class HoldOnPlugin(MaiBotPlugin):
             self.ctx,
             full_limit=int(self.config.stats.usage_limit or 5000),
             incremental_limit=max(200, min(1000, int(self.config.stats.usage_limit or 5000) // 5)),
+            since_ts=start.timestamp(),
         )
-        return self._usage_store.aggregate(start.timestamp(), end.timestamp())
+        result = self._usage_store.aggregate(start.timestamp(), end.timestamp())
+        self._maybe_export_usage_checkpoint()
+        return result
 
     def _period(self, now: datetime, item: BudgetRuleConfig) -> tuple[datetime, datetime]:
         def parse(value: str) -> time:
