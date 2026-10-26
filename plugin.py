@@ -56,10 +56,13 @@ class StatsConfig(PluginConfigBase):
     __ui_order__ = 1
     window_seconds: int = Field(default=120, ge=60, description="控制统计窗口秒数")
     usage_limit: int = Field(
-        default=50000,
+        default=30000,
         ge=100,
         le=200000,
-        description="单次聚合最多读取的成功记录数；建议大于单日全供应商请求总量，否则当日统计可能偏小",
+        description=(
+            "单次聚合最多读取的成功记录数；建议大于单日全供应商请求总量，否则当日统计可能偏小。"
+            "受宿主 RPC 单帧 16MB 限制，单次查询约 3.7 万行封顶，超过会自动减半降级"
+        ),
     )
 
 class CatalogModel(PluginConfigBase):

@@ -145,30 +145,75 @@ def aggregate_usage_rows(
     }
 
 
-async def _query_model_usage(database: Any, *, limit: int, logger: Any = None) -> List[Dict[str, Any]]:
-    try:
-        result = await database.query(
-            model_name="ModelUsage",
-            query_type="get",
-            order_by=["-id"],
-            limit=max(100, int(limit or 5000)),
-        )
-    except Exception as exc:
-        if logger is not None:
-            logger.warning("hold_on 读取 ModelUsage 失败: %s", exc)
-        return []
+_FRAME_RETRY_FLOOR = 2000
+_retry_warned_at = 0.0
+
+
+def _coerce_usage_rows(result: Any) -> Optional[List[Dict[str, Any]]]:
+    """把宿主返回值整理成行列表；无法识别时返回 None。"""
 
     if isinstance(result, list):
-        return [r for r in result if isinstance(r, dict)]
+        return [row for row in result if isinstance(row, dict)]
     if isinstance(result, dict):
         nested = result.get("result")
         if isinstance(nested, list):
-            return [r for r in nested if isinstance(r, dict)]
-        if result.get("success") is False and logger is not None:
-            logger.warning("hold_on 读取 ModelUsage 失败: %s", result.get("error"))
-    elif logger is not None:
-        logger.warning("hold_on ModelUsage 返回非列表: %s", type(result).__name__)
-    return []
+            return [row for row in nested if isinstance(row, dict)]
+    return None
+
+
+async def _query_model_usage(database: Any, *, limit: int, logger: Any = None) -> List[Dict[str, Any]]:
+    """读取最近的 ModelUsage 行。
+
+    RPC 单帧上限 16MB（``plugin_runtime.transport.base.MAX_FRAME_SIZE``，约 3.7 万行
+    ModelUsage），行数过多时宿主直接拒绝该帧。这里按上限减半重试，避免整批丢弃被当成
+    「零用量」——那会让限速静默失效。
+    """
+
+    global _retry_warned_at
+
+    requested = max(100, int(limit or 5000))
+    attempt = requested
+    while True:
+        error: Any = None
+        rows: Optional[List[Dict[str, Any]]] = None
+        try:
+            result = await database.query(
+                model_name="ModelUsage",
+                query_type="get",
+                order_by=["-id"],
+                limit=attempt,
+            )
+        except Exception as exc:
+            error = exc
+        else:
+            rows = _coerce_usage_rows(result)
+            if rows is None:
+                error = result.get("error") if isinstance(result, dict) else type(result).__name__
+
+        if error is None:
+            if attempt < requested and logger is not None:
+                now = time.time()
+                if now - _retry_warned_at >= 3600:
+                    _retry_warned_at = now
+                    logger.warning(
+                        "hold_on 单次查询被 RPC 帧上限压缩到 %d 行（[stats].usage_limit=%d），"
+                        "当日统计可能偏小；建议把 usage_limit 调到 30000 以内",
+                        attempt,
+                        requested,
+                    )
+            return rows or []
+
+        if attempt <= _FRAME_RETRY_FLOOR:
+            if logger is not None:
+                logger.warning("hold_on 读取 ModelUsage 失败: %s", error)
+            return []
+
+        nxt = max(_FRAME_RETRY_FLOOR, attempt // 2)
+        if logger is not None:
+            logger.warning(
+                "hold_on 读取 ModelUsage 失败（limit=%d）: %s；降级到 %d 行重试", attempt, error, nxt
+            )
+        attempt = nxt
 
 
 def _row_id(row: Dict[str, Any]) -> int:
