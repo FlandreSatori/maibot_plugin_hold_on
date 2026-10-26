@@ -147,6 +147,23 @@ def aggregate_usage_rows(
 
 _FRAME_RETRY_FLOOR = 2000
 _retry_warned_at = 0.0
+_limit_warned_at = 0.0
+
+# 宿主 RPC 单帧上限 16MB（``plugin_runtime.transport.base.MAX_FRAME_SIZE``）。
+# ModelUsage 单行 msgpack 编码实测约 425~431 字节（16 个字段名占了大头），换算下来
+# 35000 行约 14.3MB，而 40000 行已达 16.4MB —— 必然被宿主拒绝。这里给出单次查询的
+# 行数硬上限，任何调用方（含种子扩量）都不得超过，超出部分只能靠后续增量补齐。
+_MAX_ROWS_PER_QUERY = 35000
+
+
+def _effective_limit(limit: Any, default: int = 5000) -> int:
+    """把调用方期望的行数夹到宿主帧上限之内。"""
+
+    try:
+        value = int(limit or default)
+    except (TypeError, ValueError):
+        value = default
+    return min(max(100, value), _MAX_ROWS_PER_QUERY)
 
 
 def _coerce_usage_rows(result: Any) -> Optional[List[Dict[str, Any]]]:
@@ -164,14 +181,29 @@ def _coerce_usage_rows(result: Any) -> Optional[List[Dict[str, Any]]]:
 async def _query_model_usage(database: Any, *, limit: int, logger: Any = None) -> List[Dict[str, Any]]:
     """读取最近的 ModelUsage 行。
 
-    RPC 单帧上限 16MB（``plugin_runtime.transport.base.MAX_FRAME_SIZE``，约 3.7 万行
-    ModelUsage），行数过多时宿主直接拒绝该帧。这里按上限减半重试，避免整批丢弃被当成
+    RPC 单帧上限 16MB（``plugin_runtime.transport.base.MAX_FRAME_SIZE``）。ModelUsage
+    单行 msgpack 编码约 430 字节，因此单次最多只能取回约 3.7 万行：请求量先按
+    ``_MAX_ROWS_PER_QUERY`` 夹紧，万一仍然撞上帧上限就按半降级重试，避免整批丢弃被当成
     「零用量」——那会让限速静默失效。
     """
 
-    global _retry_warned_at
+    global _retry_warned_at, _limit_warned_at
 
-    requested = max(100, int(limit or 5000))
+    requested = _effective_limit(limit)
+    try:
+        wanted = int(limit or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    if logger is not None and wanted > requested:
+        now = time.time()
+        if now - _limit_warned_at >= 3600:
+            _limit_warned_at = now
+            logger.warning(
+                "hold_on 请求的 usage_limit=%s 超过宿主 16MB 帧上限可承载的行数，"
+                "本次按 %d 行读取（当日统计可能偏小）",
+                limit,
+                requested,
+            )
     attempt = requested
     while True:
         error: Any = None
@@ -417,9 +449,9 @@ class IncrementalUsageStore:
         async with self._lock:
             incremental = bool(self._rows) or self._fallback is not None
             limit = (
-                max(100, int(incremental_limit or 500))
+                _effective_limit(incremental_limit or 500)
                 if incremental
-                else max(100, int(full_limit or 5000))
+                else _effective_limit(full_limit or 5000)
             )
             rows = await _query_model_usage(database, limit=limit, logger=logger)
             if not incremental:
@@ -440,10 +472,11 @@ class IncrementalUsageStore:
                 and min_new_id > prev_last_id + 1
             ):
                 # 增量窗口截断：两次刷新之间新增行数超过窗口，中间行已丢失，立即全量补齐
+                full_limit_rows = _effective_limit(full_limit or 5000)
                 full_rows = await _query_model_usage(
-                    database, limit=max(100, int(full_limit or 5000)), logger=logger
+                    database, limit=full_limit_rows, logger=logger
                 )
-                self._last_seed_short = len(full_rows) < max(100, int(full_limit or 5000))
+                self._last_seed_short = len(full_rows) < full_limit_rows
                 if full_rows:
                     self._merge_rows(full_rows)
             if self._required_since > 0 and (not incremental or moved_back):
@@ -465,7 +498,7 @@ class IncrementalUsageStore:
                 database, new_anchor=float(since_ts), full_limit=full_limit, logger=logger
             )
             return
-        limit = max(100, int(incremental_limit or 500))
+        limit = _effective_limit(incremental_limit or 500)
         rows = await _query_model_usage(database, limit=limit, logger=logger)
         if not rows:
             return
@@ -475,7 +508,7 @@ class IncrementalUsageStore:
         self._fallback = None
         if len(rows) >= limit and min(_row_id(row) for row in rows) > self._last_id + 1:
             # 停机/节流期间新增行数超过增量窗口：扩大一次补缺口
-            bigger = max(100, int(full_limit or 5000))
+            bigger = _effective_limit(full_limit or 5000)
             rows = await _query_model_usage(database, limit=bigger, logger=logger)
             if not rows:
                 return
@@ -497,7 +530,7 @@ class IncrementalUsageStore:
         full_limit: int,
         logger: Any,
     ) -> None:
-        bigger = max(100, int(full_limit or 5000), 40000)
+        bigger = _effective_limit(max(int(full_limit or 5000), 40000))
         rows = await _query_model_usage(database, limit=bigger, logger=logger)
         self._last_seed_short = len(rows) < bigger  # 未取满即整表已读完，此时不存在覆盖缺口
         self._base_anchor = new_anchor
@@ -529,9 +562,10 @@ class IncrementalUsageStore:
                 self._cap_warned_at = now
                 logger.warning(
                     "hold_on 新周期用量窗口起点 (%s) 未能完全覆盖（最早行 %s），当日统计可能偏小；"
-                    "请调大 [stats].usage_limit（建议大于单日全供应商请求总量）",
+                    "请确认 [stats].usage_limit 覆盖单日行数（单次查询上限 %d 行，受宿主 16MB 帧限制）",
                     datetime.fromtimestamp(new_anchor).strftime("%m-%d %H:%M"),
                     datetime.fromtimestamp(oldest).strftime("%m-%d %H:%M"),
+                    _MAX_ROWS_PER_QUERY,
                 )
 
     def _merge_checkpoint_rows(self, rows: List[Dict[str, Any]]) -> None:
@@ -595,7 +629,7 @@ class IncrementalUsageStore:
         oldest = self._oldest_ts()
         if oldest <= 0 or oldest <= self._required_since + epsilon:
             return
-        bigger_limit = max(100, int(full_limit or 5000), 40000)
+        bigger_limit = _effective_limit(max(int(full_limit or 5000), 40000))
         if logger is not None:
             logger.info(
                 "hold_on 用量种子窗口不足（最早行 %.0fs < 窗口起点 %.0fs），扩量至 %d 行重拉",
@@ -611,9 +645,10 @@ class IncrementalUsageStore:
         if oldest > 0 and oldest > self._required_since + epsilon and logger is not None:
             logger.warning(
                 "hold_on 内存用量窗口起点 (%s) 仍晚于查询窗口起点 (%s)，当日统计可能偏小；"
-                "请调大 [stats].usage_limit（建议大于单日全供应商请求总量）",
+                "请确认 [stats].usage_limit 覆盖单日行数（单次查询上限 %d 行，受宿主 16MB 帧限制）",
                 datetime.fromtimestamp(oldest).strftime("%m-%d %H:%M"),
                 datetime.fromtimestamp(self._required_since).strftime("%m-%d %H:%M"),
+                _MAX_ROWS_PER_QUERY,
             )
 
     def _oldest_ts(self) -> float:
