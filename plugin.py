@@ -56,7 +56,7 @@ class StatsConfig(PluginConfigBase):
     __ui_order__ = 1
     window_seconds: int = Field(default=120, ge=60, description="控制统计窗口秒数")
     usage_limit: int = Field(
-        default=5000,
+        default=50000,
         ge=100,
         le=200000,
         description="单次聚合最多读取的成功记录数；建议大于单日全供应商请求总量，否则当日统计可能偏小",
@@ -364,12 +364,18 @@ class HoldOnPlugin(MaiBotPlugin):
             )
         return True
 
-    async def _usage(self, start: datetime, end: datetime) -> Dict[str, Any]:
+    async def _usage(self, start: datetime, end: datetime, *, rebase: bool = True) -> Dict[str, Any]:
+        """读取用量。
+
+        ``rebase`` 仅在 ``start`` 是预算周期起点时为 True；回查类调用（如错误停模
+        结束时刻）必须传 False，否则 checkpoint 会把当日基线重设到该时刻。
+        """
         await self._usage_store.refresh(
             self.ctx,
             full_limit=int(self.config.stats.usage_limit or 5000),
             incremental_limit=max(200, min(1000, int(self.config.stats.usage_limit or 5000) // 5)),
             since_ts=start.timestamp(),
+            rebase=rebase,
         )
         result = self._usage_store.aggregate(start.timestamp(), end.timestamp())
         self._maybe_export_usage_checkpoint()
@@ -488,7 +494,8 @@ class HoldOnPlugin(MaiBotPlugin):
             return
         scope, target = self.state.streak_target()
         start = datetime.fromtimestamp(anchor)
-        metrics = await self._usage(start, datetime.now())
+        # 回查起点只是「停模结束时刻」，不是预算周期起点：禁止重设 checkpoint 基线
+        metrics = await self._usage(start, datetime.now(), rebase=False)
         if self._scoped_success_count(metrics, scope, target) > 0:
             self.state.reset_error_hold_streak()
 

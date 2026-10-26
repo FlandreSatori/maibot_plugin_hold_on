@@ -333,12 +333,17 @@ class IncrementalUsageStore:
         full_limit: int,
         incremental_limit: int = 500,
         since_ts: float = 0.0,
+        rebase: bool = True,
     ) -> None:
         """拉取新记录合并进内存；无新行时不做任何重计算。
 
         ``since_ts``：当前查询窗口起点（如预算周期开始时刻）。账本模式下窗口起点
         之后的记录不会因行数上限被淘汰；checkpoint 模式下窗口起点越过基线锚点时
         触发基线重设。
+
+        ``rebase``：是否允许 checkpoint 模式按 ``since_ts`` 重设基线。只有「预算周期
+        起点推进」（如跨零点）才应置 True；``since_ts`` 只是任意回查起点（如错误停模
+        结束时刻）时必须置 False，否则会把当日基线截断到该时刻、统计瞬间归零。
         """
 
         logger = getattr(ctx, "logger", None)
@@ -353,6 +358,7 @@ class IncrementalUsageStore:
                 await self._refresh_checkpoint(
                     database,
                     since_ts=since_ts,
+                    rebase=rebase,
                     full_limit=full_limit,
                     incremental_limit=incremental_limit,
                     logger=logger,
@@ -406,9 +412,10 @@ class IncrementalUsageStore:
         full_limit: int,
         incremental_limit: int,
         logger: Any,
+        rebase: bool = True,
     ) -> None:
         # 查询窗口起点越过基线锚点（预算周期跨越，如零点）：重设基线，只聚合新周期内的行
-        if since_ts and float(since_ts) > self._base_anchor + 1.0:
+        if rebase and since_ts and float(since_ts) > self._base_anchor + 1.0:
             await self._rebase_checkpoint(
                 database, new_anchor=float(since_ts), full_limit=full_limit, logger=logger
             )
@@ -483,18 +490,27 @@ class IncrementalUsageStore:
                 )
 
     def _merge_checkpoint_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """合并带 id 的新行（查询结果按 id 倒序返回）。
+
+        跳过判断必须基于合并前的 ``_last_id``：倒序遍历时若边合并边更新 ``_last_id``，
+        第二批起的较小 id 会被误判为旧行，导致每次刷新只并入最新 1 行。
+        """
+
+        prev_last_id = self._last_id
+        max_id = prev_last_id
         views: List[Dict[str, Any]] = []
         for row in rows:
             rid = _row_id(row)
-            if rid <= 0 or rid <= self._last_id:
+            if rid <= 0 or rid <= prev_last_id:
                 continue
             view = usage_row_view(row)
             view.pop("raw", None)
             if float(view.get("ts") or 0) >= self._base_anchor:
                 views.append(view)
                 _fold_view(self._base_groups, self._base_total, view)
-            if rid > self._last_id:
-                self._last_id = rid
+            if rid > max_id:
+                max_id = rid
+        self._last_id = max_id
         self._append_ring(views)
 
     def _append_ring(self, views: List[Dict[str, Any]]) -> None:
